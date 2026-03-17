@@ -12,9 +12,9 @@ import (
 // skipped.
 type TextRenderer interface {
 	// RenderText returns PDF operators to render text at the given position.
-	// fontSize is in PDF points. The returned string is inserted into the
-	// content stream as-is.
-	RenderText(text string, x, y, fontSize float64, fontFamily, fontWeight, fontStyle string, fill Color) string
+	// fontSize is in PDF points. textAnchor is "start", "middle", or "end".
+	// The returned string is inserted into the content stream as-is.
+	RenderText(text string, x, y, fontSize float64, fontFamily, fontWeight, fontStyle, textAnchor string, fill Color) string
 }
 
 // RenderOptions controls PDF rendering.
@@ -225,9 +225,13 @@ func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
 		}
+		fontFamily := e.FontFamily
+		if fontFamily == "" {
+			fontFamily = r.doc.FontFamily
+		}
 		s := r.opts.TextRenderer.RenderText(
 			e.Content, e.X, e.Y, e.FontSize,
-			e.FontFamily, e.FontWeight, e.FontStyle,
+			fontFamily, e.FontWeight, e.FontStyle, e.TextAnchor,
 			fillColor,
 		)
 		if s != "" {

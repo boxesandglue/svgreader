@@ -77,7 +77,7 @@ func TestResolveToAbsolute(t *testing.T) {
 
 func TestParseColor(t *testing.T) {
 	tests := []struct {
-		input string
+		input   string
 		r, g, b float64
 		none    bool
 	}{

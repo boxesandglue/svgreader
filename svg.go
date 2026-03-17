@@ -21,10 +21,11 @@ import (
 
 // Document represents a parsed SVG document.
 type Document struct {
-	Width    float64   // Document width in SVG user units
-	Height   float64   // Document height in SVG user units
-	ViewBox  ViewBox   // ViewBox specification
-	Elements []Element // Child elements in document order
+	Width      float64   // Document width in SVG user units
+	Height     float64   // Document height in SVG user units
+	ViewBox    ViewBox   // ViewBox specification
+	Elements   []Element // Child elements in document order
+	FontFamily string    // Default font-family from the <svg> element
 }
 
 // ViewBox defines the SVG coordinate system.
@@ -69,9 +70,9 @@ func (Rect) elementTag() string { return "rect" }
 
 // Circle represents an SVG <circle> element.
 type Circle struct {
-	Cx, Cy float64
-	R      float64
-	Style  StyleAttrs
+	Cx, Cy    float64
+	R         float64
+	Style     StyleAttrs
 	Transform string
 }
 
@@ -79,9 +80,9 @@ func (Circle) elementTag() string { return "circle" }
 
 // Ellipse represents an SVG <ellipse> element.
 type Ellipse struct {
-	Cx, Cy float64
-	Rx, Ry float64
-	Style  StyleAttrs
+	Cx, Cy    float64
+	Rx, Ry    float64
+	Style     StyleAttrs
 	Transform string
 }
 
@@ -89,9 +90,9 @@ func (Ellipse) elementTag() string { return "ellipse" }
 
 // Line represents an SVG <line> element.
 type Line struct {
-	X1, Y1 float64
-	X2, Y2 float64
-	Style  StyleAttrs
+	X1, Y1    float64
+	X2, Y2    float64
+	Style     StyleAttrs
 	Transform string
 }
 
@@ -99,8 +100,8 @@ func (Line) elementTag() string { return "line" }
 
 // Polyline represents an SVG <polyline> element.
 type Polyline struct {
-	Points []Point
-	Style  StyleAttrs
+	Points    []Point
+	Style     StyleAttrs
 	Transform string
 }
 
@@ -108,8 +109,8 @@ func (Polyline) elementTag() string { return "polyline" }
 
 // Polygon represents an SVG <polygon> element.
 type Polygon struct {
-	Points []Point
-	Style  StyleAttrs
+	Points    []Point
+	Style     StyleAttrs
 	Transform string
 }
 
@@ -124,6 +125,7 @@ type Text struct {
 	FontSize   float64
 	FontWeight string
 	FontStyle  string
+	TextAnchor string // "start", "middle", "end"
 	Style      StyleAttrs
 	Transform  string
 }
@@ -137,18 +139,18 @@ type Point struct {
 
 // StyleAttrs holds SVG presentation attributes.
 type StyleAttrs struct {
-	Fill          string
-	FillOpacity   string
-	Stroke        string
-	StrokeWidth   string
-	StrokeOpacity string
-	StrokeLinecap string
-	StrokeLinejoin string
-	StrokeDasharray string
+	Fill             string
+	FillOpacity      string
+	Stroke           string
+	StrokeWidth      string
+	StrokeOpacity    string
+	StrokeLinecap    string
+	StrokeLinejoin   string
+	StrokeDasharray  string
 	StrokeDashoffset string
-	Opacity       string
-	FillRule      string
-	ClipPath      string
+	Opacity          string
+	FillRule         string
+	ClipPath         string
 }
 
 // Parse parses an SVG document from a reader.
@@ -178,6 +180,8 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 			doc.Height = parseDimension(attr.Value)
 		case "viewBox":
 			doc.ViewBox = parseViewBox(attr.Value)
+		case "font-family":
+			doc.FontFamily = attr.Value
 		}
 	}
 
@@ -253,7 +257,7 @@ func parseElement(dec *xml.Decoder, start xml.StartElement) (Element, error) {
 		dec.Skip()
 		return Circle{
 			Cx: attrFloat(attrs, "cx"), Cy: attrFloat(attrs, "cy"),
-			R: attrFloat(attrs, "r"),
+			R:     attrFloat(attrs, "r"),
 			Style: style, Transform: transform,
 		}, nil
 
@@ -277,14 +281,14 @@ func parseElement(dec *xml.Decoder, start xml.StartElement) (Element, error) {
 		dec.Skip()
 		return Polyline{
 			Points: parsePoints(attrs["points"]),
-			Style: style, Transform: transform,
+			Style:  style, Transform: transform,
 		}, nil
 
 	case "polygon":
 		dec.Skip()
 		return Polygon{
 			Points: parsePoints(attrs["points"]),
-			Style: style, Transform: transform,
+			Style:  style, Transform: transform,
 		}, nil
 
 	case "text":
@@ -299,6 +303,7 @@ func parseElement(dec *xml.Decoder, start xml.StartElement) (Element, error) {
 			FontSize:   parseDimension(firstOf(attrs["font-size"], styleValue(attrs, "font-size"), "12")),
 			FontWeight: firstOf(attrs["font-weight"], styleValue(attrs, "font-weight")),
 			FontStyle:  firstOf(attrs["font-style"], styleValue(attrs, "font-style")),
+			TextAnchor: firstOf(attrs["text-anchor"], styleValue(attrs, "text-anchor")),
 			Style:      style,
 			Transform:  transform,
 		}, nil

@@ -315,7 +315,7 @@ func ResolveToAbsolute(cmds []PathCommand) []PathCommand {
 // computing the reflected control point from the previous command.
 func ExpandShorthands(cmds []PathCommand) []PathCommand {
 	var result []PathCommand
-	var cx, cy float64        // current point
+	var cx, cy float64               // current point
 	var lastCtrlX, lastCtrlY float64 // last control point for reflection
 	var lastCmd byte
 
