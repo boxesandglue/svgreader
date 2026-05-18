@@ -70,6 +70,8 @@ type resolvedStyle struct {
 	opacity       float64
 	linecap       int // 0=butt, 1=round, 2=square
 	linejoin      int // 0=miter, 1=round, 2=bevel
+	dashArray     []float64
+	dashOffset    float64
 	fillRule      string
 }
 
@@ -367,6 +369,15 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 		r.emitf("%s w", fmtF(style.strokeWidth))
 		r.emitf("%d J", style.linecap)
 		r.emitf("%d j", style.linejoin)
+		if len(style.dashArray) > 0 {
+			parts := make([]string, 0, len(style.dashArray))
+			for _, v := range style.dashArray {
+				parts = append(parts, fmtF(v))
+			}
+			r.emitf("[%s] %s d", strings.Join(parts, " "), fmtF(style.dashOffset))
+		} else {
+			r.emit("[] 0 d")
+		}
 	}
 }
 
@@ -464,10 +475,47 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs) resolvedStyle {
 			s.linejoin = 2
 		}
 	}
+	if attrs.StrokeDasharray != "" {
+		s.dashArray = parseDashArray(attrs.StrokeDasharray)
+		s.dashOffset = 0
+	}
+	if attrs.StrokeDashoffset != "" {
+		if v, err := strconv.ParseFloat(strings.TrimSpace(attrs.StrokeDashoffset), 64); err == nil {
+			s.dashOffset = v
+		}
+	}
 	if attrs.FillRule != "" {
 		s.fillRule = attrs.FillRule
 	}
 	return s
+}
+
+// parseDashArray parses an SVG stroke-dasharray attribute into a float64 slice
+// suitable for the PDF d operator. Returns nil for "none", empty input, or any
+// unparseable / negative value (meaning: solid stroke per SVG spec). Odd-length
+// arrays are doubled (SVG 1.1 §11.4).
+func parseDashArray(s string) []float64 {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.EqualFold(s, "none") {
+		return nil
+	}
+	s = strings.ReplaceAll(s, ",", " ")
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return nil
+	}
+	vals := make([]float64, 0, len(fields))
+	for _, f := range fields {
+		v, err := strconv.ParseFloat(f, 64)
+		if err != nil || v < 0 {
+			return nil
+		}
+		vals = append(vals, v)
+	}
+	if len(vals)%2 != 0 {
+		vals = append(vals, vals...)
+	}
+	return vals
 }
 
 // arcToCubic converts an SVG arc to a series of cubic Bézier curves.
