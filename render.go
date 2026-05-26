@@ -17,6 +17,26 @@ type TextRenderer interface {
 	RenderText(text string, x, y, fontSize float64, fontFamily, fontWeight, fontStyle, textAnchor string, fill Color) string
 }
 
+// ShadingRegistrar is implemented by callers (e.g. boxesandglue) to make a
+// gradient available as a PDF Pattern resource. RegisterShading is invoked
+// once per gradient fill encountered during rendering; it returns the
+// resource name (without leading slash) that the renderer then writes as
+// "/<name> scn" into the content stream. The same gradient may be
+// registered multiple times — implementations may dedupe, but the renderer
+// does not require it.
+type ShadingRegistrar interface {
+	RegisterShading(req ShadingRequest) string
+}
+
+// ShadingRequest is the data the registrar needs to materialise a PDF
+// shading-pattern object. CTM is the renderer's current transformation
+// matrix at the point of fill; gradients use it together with their own
+// GradientTransform to build the pattern-to-page mapping.
+type ShadingRequest struct {
+	Gradient *LinearGradient
+	CTM      Matrix
+}
+
 // RenderOptions controls PDF rendering.
 type RenderOptions struct {
 	// Width and Height specify the output size in PDF points.
@@ -25,6 +45,12 @@ type RenderOptions struct {
 
 	// TextRenderer handles <text> elements. If nil, text is skipped.
 	TextRenderer TextRenderer
+
+	// ShadingRegistrar, if non-nil, receives gradient fills and returns the
+	// page-resource name the renderer should use in the content stream.
+	// When nil, gradient fills degrade to the first stop's flat color (or
+	// to "no fill" when the gradient has no stops).
+	ShadingRegistrar ShadingRegistrar
 }
 
 // RenderPDF renders the SVG document as a PDF content stream.
@@ -43,18 +69,66 @@ type renderer struct {
 	doc  *Document
 	opts RenderOptions
 	buf  strings.Builder
+	// ctmStack mirrors the PDF graphics state stack. Each pushQ() copies
+	// the top onto the stack; popQ() drops the top. The top is always
+	// the current CTM. Needed because PDF Pattern matrices map to the
+	// default coordinate space (page coords), so a gradient fill applied
+	// to a path with a nested transform must bake the surrounding CTM
+	// into the pattern matrix.
+	ctmStack []Matrix
+}
+
+// pushQ saves the graphics state and duplicates the current CTM onto the
+// stack so subsequent transforms accumulate into a new top.
+func (r *renderer) pushQ() {
+	r.emit("q")
+	var top Matrix
+	if n := len(r.ctmStack); n > 0 {
+		top = r.ctmStack[n-1]
+	} else {
+		top = Identity()
+	}
+	r.ctmStack = append(r.ctmStack, top)
+}
+
+// popQ restores the graphics state and drops the matching CTM frame.
+func (r *renderer) popQ() {
+	r.emit("Q")
+	if n := len(r.ctmStack); n > 0 {
+		r.ctmStack = r.ctmStack[:n-1]
+	}
+}
+
+// applyTransform emits a cm operator and folds the transform into the
+// current CTM frame. SVG-spec composition order: child = parent × local.
+func (r *renderer) applyTransform(m Matrix) {
+	r.emit(m.PDFOperator())
+	if n := len(r.ctmStack); n > 0 {
+		r.ctmStack[n-1] = r.ctmStack[n-1].Multiply(m)
+	}
+}
+
+// currentCTM returns the active CTM (identity if the stack is empty).
+func (r *renderer) currentCTM() Matrix {
+	if n := len(r.ctmStack); n > 0 {
+		return r.ctmStack[n-1]
+	}
+	return Identity()
 }
 
 // defaultStyle returns the SVG default style (black fill, no stroke).
 func defaultStyle() resolvedStyle {
 	return resolvedStyle{
-		fill:        Color{0, 0, 0, false}, // black
-		fillSet:     true,
-		stroke:      Color{IsNone: true},
-		strokeWidth: 1,
-		linecap:     0, // butt
-		linejoin:    0, // miter
-		fillRule:    "nonzero",
+		fill:          Color{0, 0, 0, false}, // black
+		fillSet:       true,
+		stroke:        Color{IsNone: true},
+		strokeWidth:   1,
+		fillOpacity:   1,
+		strokeOpacity: 1,
+		opacity:       1,
+		linecap:       0, // butt
+		linejoin:      0, // miter
+		fillRule:      "nonzero",
 	}
 }
 
@@ -62,6 +136,7 @@ func defaultStyle() resolvedStyle {
 type resolvedStyle struct {
 	fill          Color
 	fillSet       bool
+	fillGradient  *LinearGradient // set when fill="url(#id)" resolves
 	stroke        Color
 	strokeSet     bool
 	strokeWidth   float64
@@ -73,6 +148,22 @@ type resolvedStyle struct {
 	dashArray     []float64
 	dashOffset    float64
 	fillRule      string
+}
+
+// hasFillPaint reports whether the style produces any fill (flat color or
+// gradient). Drives both applyStyle (which operator to emit) and
+// emitPaintOp (whether the path should be filled at all).
+//
+// fill-opacity=0 makes the element invisible: a common SVG idiom for
+// hit-target paths under an opaque graphic. Treating it as no-fill here
+// avoids the alternative — a full ExtGState / SMask plumbing — that
+// would otherwise be needed for general fractional opacity, which we
+// don't yet support.
+func (s resolvedStyle) hasFillPaint() bool {
+	if s.fillOpacity == 0 {
+		return false
+	}
+	return s.fillGradient != nil || !s.fill.IsNone
 }
 
 func (r *renderer) render() string {
@@ -88,7 +179,7 @@ func (r *renderer) render() string {
 	vb := r.doc.ViewBox
 
 	// Save graphics state
-	r.emit("q")
+	r.pushQ()
 
 	// Coordinate transform: SVG (Y-down) → Rule-local (Y-up, origin at top)
 	//
@@ -100,12 +191,10 @@ func (r *renderer) render() string {
 	if vb.Width > 0 && vb.Height > 0 {
 		sx := width / vb.Width
 		sy := height / vb.Height
-		m := Matrix{sx, 0, 0, -sy, -vb.MinX * sx, vb.MinY * sy}
-		r.emit(m.PDFOperator())
+		r.applyTransform(Matrix{sx, 0, 0, -sy, -vb.MinX * sx, vb.MinY * sy})
 	} else {
 		// No viewBox: just flip Y
-		m := Matrix{1, 0, 0, -1, 0, 0}
-		r.emit(m.PDFOperator())
+		r.applyTransform(Matrix{1, 0, 0, -1, 0, 0})
 	}
 
 	style := defaultStyle()
@@ -114,7 +203,7 @@ func (r *renderer) render() string {
 	}
 
 	// Restore graphics state
-	r.emit("Q")
+	r.popQ()
 
 	return r.buf.String()
 }
@@ -122,107 +211,98 @@ func (r *renderer) render() string {
 func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 	switch e := elem.(type) {
 	case Group:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		for _, child := range e.Children {
 			r.renderElement(child, style)
 		}
-		r.emit("Q")
+		r.popQ()
 
 	case Path:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderPath(e.D, style)
-		r.emit("Q")
+		r.popQ()
 
 	case Rect:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderRect(e, style)
-		r.emit("Q")
+		r.popQ()
 
 	case Circle:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.R, e.R, style)
-		r.emit("Q")
+		r.popQ()
 
 	case Ellipse:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.Rx, e.Ry, style)
-		r.emit("Q")
+		r.popQ()
 
 	case Line:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.emitf("%s %s m %s %s l", fmtF(e.X1), fmtF(e.Y1), fmtF(e.X2), fmtF(e.Y2))
 		r.emitPaintOp(style)
-		r.emit("Q")
+		r.popQ()
 
 	case Polyline:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, false)
 		r.emitPaintOp(style)
-		r.emit("Q")
+		r.popQ()
 
 	case Polygon:
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, true)
 		r.emitPaintOp(style)
-		r.emit("Q")
+		r.popQ()
 
 	case Text:
 		if r.opts.TextRenderer == nil {
 			return
 		}
-		r.emit("q")
+		r.pushQ()
 		if e.Transform != "" {
-			m := ParseTransform(e.Transform)
-			r.emit(m.PDFOperator())
+			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style)
+		style := mergeStyle(inherited, e.Style, r.doc.Defs)
 		fillColor := style.fill
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
@@ -239,7 +319,7 @@ func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 		if s != "" {
 			r.emit(s)
 		}
-		r.emit("Q")
+		r.popQ()
 	}
 }
 
@@ -361,8 +441,37 @@ func (r *renderer) renderPolyPoints(pts []Point, close bool) {
 
 // applyStyle emits PDF operators for colors, line width, etc.
 func (r *renderer) applyStyle(style resolvedStyle) {
-	if !style.fill.IsNone {
-		r.emit(style.fill.PDFNonstroking())
+	if style.hasFillPaint() {
+		switch {
+		case style.fillGradient != nil:
+			// Pattern-fill path: register the gradient with the host
+			// (which allocates an indirect PDF object + page-resource
+			// name) and switch into the Pattern color space.
+			// /<name> scn binds the pattern as the non-stroking color;
+			// subsequent f / f* operate against it just like a flat
+			// color.
+			emitted := false
+			if reg := r.opts.ShadingRegistrar; reg != nil {
+				name := reg.RegisterShading(ShadingRequest{
+					Gradient: style.fillGradient,
+					CTM:      r.currentCTM(),
+				})
+				if name != "" {
+					r.emit("/Pattern cs")
+					r.emitf("/%s scn", name)
+					emitted = true
+				}
+			}
+			// No registrar (or it declined) → degrade to first stop's
+			// color. Better than dropping the fill silently; preserves
+			// the original behaviour for callers that don't care about
+			// gradients.
+			if !emitted && len(style.fillGradient.Stops) > 0 {
+				r.emit(style.fillGradient.Stops[0].Color.PDFNonstroking())
+			}
+		case !style.fill.IsNone:
+			r.emit(style.fill.PDFNonstroking())
+		}
 	}
 	if !style.stroke.IsNone {
 		r.emit(style.stroke.PDFStroking())
@@ -383,7 +492,7 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 
 // emitPaintOp emits the appropriate PDF paint operator based on fill/stroke.
 func (r *renderer) emitPaintOp(style resolvedStyle) {
-	hasFill := !style.fill.IsNone
+	hasFill := style.hasFillPaint()
 	hasStroke := !style.stroke.IsNone
 
 	switch {
@@ -418,13 +527,30 @@ func (r *renderer) emitf(format string, args ...any) {
 }
 
 // mergeStyle applies an element's style attributes on top of the inherited style.
-func mergeStyle(parent resolvedStyle, attrs StyleAttrs) resolvedStyle {
+func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearGradient) resolvedStyle {
 	s := parent
 
 	if attrs.Fill != "" {
-		c, err := ParseColor(attrs.Fill)
-		if err == nil {
-			s.fill = c
+		paint := resolvePaint(attrs.Fill)
+		switch paint.Kind {
+		case PaintGradient:
+			if g, ok := defs[paint.GradientRef]; ok {
+				s.fillGradient = g
+				// Clear any inherited flat fill so applyStyle goes through
+				// the gradient branch.
+				s.fill = Color{IsNone: true}
+				s.fillSet = true
+			}
+			// Unresolved gradient ref: keep the inherited fill rather than
+			// silently flipping to black — matches Firefox behaviour for
+			// dangling url() refs.
+		case PaintColor:
+			s.fill = paint.Color
+			s.fillGradient = nil
+			s.fillSet = true
+		case PaintNone:
+			s.fill = Color{IsNone: true}
+			s.fillGradient = nil
 			s.fillSet = true
 		}
 	}

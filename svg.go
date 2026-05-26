@@ -21,11 +21,12 @@ import (
 
 // Document represents a parsed SVG document.
 type Document struct {
-	Width      float64   // Document width in SVG user units
-	Height     float64   // Document height in SVG user units
-	ViewBox    ViewBox   // ViewBox specification
-	Elements   []Element // Child elements in document order
-	FontFamily string    // Default font-family from the <svg> element
+	Width      float64                    // Document width in SVG user units
+	Height     float64                    // Document height in SVG user units
+	ViewBox    ViewBox                    // ViewBox specification
+	Elements   []Element                  // Child elements in document order
+	FontFamily string                     // Default font-family from the <svg> element
+	Defs       map[string]*LinearGradient // Gradient definitions keyed by id
 }
 
 // ViewBox defines the SVG coordinate system.
@@ -170,7 +171,7 @@ func Parse(r io.Reader) (*Document, error) {
 }
 
 func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
-	doc := &Document{}
+	doc := &Document{Defs: map[string]*LinearGradient{}}
 
 	for _, attr := range start.Attr {
 		switch attr.Name.Local {
@@ -195,7 +196,7 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 		doc.Height = doc.ViewBox.Height
 	}
 
-	elements, err := parseChildren(dec)
+	elements, err := parseChildren(dec, doc.Defs)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +204,7 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 	return doc, nil
 }
 
-func parseChildren(dec *xml.Decoder) ([]Element, error) {
+func parseChildren(dec *xml.Decoder, defs map[string]*LinearGradient) ([]Element, error) {
 	var elements []Element
 
 	for {
@@ -214,7 +215,7 @@ func parseChildren(dec *xml.Decoder) ([]Element, error) {
 
 		switch t := tok.(type) {
 		case xml.StartElement:
-			elem, err := parseElement(dec, t)
+			elem, err := parseElement(dec, t, defs)
 			if err != nil {
 				return nil, err
 			}
@@ -227,14 +228,34 @@ func parseChildren(dec *xml.Decoder) ([]Element, error) {
 	}
 }
 
-func parseElement(dec *xml.Decoder, start xml.StartElement) (Element, error) {
+func parseElement(dec *xml.Decoder, start xml.StartElement, defs map[string]*LinearGradient) (Element, error) {
 	attrs := attrMap(start.Attr)
 	style := extractStyle(attrs)
 	transform := attrs["transform"]
 
 	switch start.Name.Local {
+	case "defs":
+		if err := parseDefs(dec, defs); err != nil {
+			return nil, err
+		}
+		return nil, nil
+
+	case "linearGradient":
+		// <linearGradient> can appear either inside <defs> or directly
+		// in document/group flow (Adobe Illustrator does the latter).
+		// Route both into the shared defs map; the element does not
+		// produce any drawing output.
+		g, err := parseLinearGradient(dec, start)
+		if err != nil {
+			return nil, err
+		}
+		if g != nil && g.ID != "" {
+			defs[g.ID] = g
+		}
+		return nil, nil
+
 	case "g":
-		children, err := parseChildren(dec)
+		children, err := parseChildren(dec, defs)
 		if err != nil {
 			return nil, err
 		}
