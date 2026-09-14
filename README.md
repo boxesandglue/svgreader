@@ -1,3 +1,5 @@
+[![Explore in Constellation](https://img.shields.io/badge/Explore%20in-Constellation-blue)](https://constellation.speedata.de)
+
 # svgreader
 
 A pure Go SVG-to-PDF renderer. Parses SVG documents and produces PDF content streams — no external tools (like Inkscape or librsvg) needed.
@@ -101,6 +103,12 @@ render.go     PDF content stream renderer
 color.go      SVG color parser (hex, rgb(), named colors)
 transform.go  SVG transform parser and matrix math
 ```
+
+## Ecosystem
+
+svgreader is part of a broader ecosystem of PDF, typesetting and publishing technologies.
+
+**[Explore the constellation →](https://constellation.speedata.de)**
 
 ## License
 
