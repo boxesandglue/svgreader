@@ -154,6 +154,36 @@ type StyleAttrs struct {
 	ClipPath         string
 }
 
+// textAttrs are the presentation attributes a <text> takes from itself or,
+// when it does not set them, from its nearest ancestor that does: the
+// inherited properties of SVG 1.1 §10.10 that matter for shaping. A <g>
+// merges its own values over what it received and hands the result down.
+type textAttrs struct {
+	fontFamily string
+	fontSize   string
+	fontWeight string
+	fontStyle  string
+	textAnchor string
+}
+
+// inherit returns parent overridden by the attributes set on the element,
+// the style attribute winning over the presentation attribute as in
+// extractStyle.
+func (parent textAttrs) inherit(attrs map[string]string) textAttrs {
+	t := parent
+	pick := func(name string, dst *string) {
+		if v := firstOf(styleValue(attrs, name), attrs[name]); v != "" {
+			*dst = v
+		}
+	}
+	pick("font-family", &t.fontFamily)
+	pick("font-size", &t.fontSize)
+	pick("font-weight", &t.fontWeight)
+	pick("font-style", &t.fontStyle)
+	pick("text-anchor", &t.textAnchor)
+	return t
+}
+
 // Parse parses an SVG document from a reader.
 func Parse(r io.Reader) (*Document, error) {
 	dec := xml.NewDecoder(r)
@@ -196,7 +226,7 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 		doc.Height = doc.ViewBox.Height
 	}
 
-	elements, err := parseChildren(dec, doc.Defs)
+	elements, err := parseChildren(dec, doc.Defs, textAttrs{}.inherit(attrMap(start.Attr)))
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +234,7 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 	return doc, nil
 }
 
-func parseChildren(dec *xml.Decoder, defs map[string]*LinearGradient) ([]Element, error) {
+func parseChildren(dec *xml.Decoder, defs map[string]*LinearGradient, inherited textAttrs) ([]Element, error) {
 	var elements []Element
 
 	for {
@@ -215,7 +245,7 @@ func parseChildren(dec *xml.Decoder, defs map[string]*LinearGradient) ([]Element
 
 		switch t := tok.(type) {
 		case xml.StartElement:
-			elem, err := parseElement(dec, t, defs)
+			elem, err := parseElement(dec, t, defs, inherited)
 			if err != nil {
 				return nil, err
 			}
@@ -228,7 +258,7 @@ func parseChildren(dec *xml.Decoder, defs map[string]*LinearGradient) ([]Element
 	}
 }
 
-func parseElement(dec *xml.Decoder, start xml.StartElement, defs map[string]*LinearGradient) (Element, error) {
+func parseElement(dec *xml.Decoder, start xml.StartElement, defs map[string]*LinearGradient, inherited textAttrs) (Element, error) {
 	attrs := attrMap(start.Attr)
 	style := extractStyle(attrs)
 	transform := attrs["transform"]
@@ -255,7 +285,7 @@ func parseElement(dec *xml.Decoder, start xml.StartElement, defs map[string]*Lin
 		return nil, nil
 
 	case "g":
-		children, err := parseChildren(dec, defs)
+		children, err := parseChildren(dec, defs, inherited.inherit(attrs))
 		if err != nil {
 			return nil, err
 		}
@@ -317,14 +347,17 @@ func parseElement(dec *xml.Decoder, start xml.StartElement, defs map[string]*Lin
 		if err != nil {
 			return nil, err
 		}
+		// The font properties are inherited: a <text> without its own
+		// font-family takes the one of the enclosing <g> or <svg>.
+		ta := inherited.inherit(attrs)
 		return Text{
 			X: attrFloat(attrs, "x"), Y: attrFloat(attrs, "y"),
 			Content:    content,
-			FontFamily: firstOf(attrs["font-family"], styleValue(attrs, "font-family")),
-			FontSize:   parseDimension(firstOf(attrs["font-size"], styleValue(attrs, "font-size"), "12")),
-			FontWeight: firstOf(attrs["font-weight"], styleValue(attrs, "font-weight")),
-			FontStyle:  firstOf(attrs["font-style"], styleValue(attrs, "font-style")),
-			TextAnchor: firstOf(attrs["text-anchor"], styleValue(attrs, "text-anchor")),
+			FontFamily: ta.fontFamily,
+			FontSize:   parseDimension(firstOf(ta.fontSize, "12")),
+			FontWeight: ta.fontWeight,
+			FontStyle:  ta.fontStyle,
+			TextAnchor: ta.textAnchor,
 			Style:      style,
 			Transform:  transform,
 		}, nil

@@ -210,3 +210,36 @@ func closeEnough(a, b float64) bool {
 	}
 	return diff < 0.002
 }
+
+// TestTextInheritsFontFromGroup checks that a <text> without font attributes
+// of its own takes them from the enclosing <g> or <svg>, and that its own
+// attributes still win.
+func TestTextInheritsFontFromGroup(t *testing.T) {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" font-family="serif">
+		<g font-family="sans" font-size="11" text-anchor="middle">
+			<text x="1" y="2">inherited</text>
+			<text x="1" y="2" font-size="20" style="font-weight: bold">own</text>
+		</g>
+		<text x="1" y="2">root</text>
+	</svg>`
+	doc, err := Parse(strings.NewReader(svg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, ok := doc.Elements[0].(Group)
+	if !ok || len(g.Children) != 2 {
+		t.Fatalf("want a group with two children, got %#v", doc.Elements[0])
+	}
+	inherited := g.Children[0].(Text)
+	if inherited.FontFamily != "sans" || inherited.FontSize != 11 || inherited.TextAnchor != "middle" {
+		t.Errorf("inherited text: got family %q size %v anchor %q", inherited.FontFamily, inherited.FontSize, inherited.TextAnchor)
+	}
+	own := g.Children[1].(Text)
+	if own.FontFamily != "sans" || own.FontSize != 20 || own.FontWeight != "bold" {
+		t.Errorf("own text: got family %q size %v weight %q", own.FontFamily, own.FontSize, own.FontWeight)
+	}
+	root := doc.Elements[1].(Text)
+	if root.FontFamily != "serif" || root.FontSize != 12 {
+		t.Errorf("root text: got family %q size %v, want serif 12", root.FontFamily, root.FontSize)
+	}
+}
