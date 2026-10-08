@@ -200,6 +200,27 @@ func TestRenderPDF(t *testing.T) {
 	t.Logf("PDF content stream:\n%s", pdf)
 }
 
+// TestRenderPDFMatrixPrecision checks that a large viewBox drawn small keeps
+// its size: at 4 decimals the 3000 unit wide drawing ends 0.14pt short.
+func TestRenderPDFMatrixPrecision(t *testing.T) {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 3000 2000">
+		<rect width="3000" height="2000" fill="red"/>
+	</svg>`
+	doc, err := Parse(strings.NewReader(svg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pdf := doc.RenderPDF(RenderOptions{Width: 85.03937, Height: 56.692913})
+	want := "0.028346 0 0 -0.028346 0 0 cm"
+	if !strings.Contains(pdf, want) {
+		t.Errorf("missing %q in\n%s", want, pdf)
+	}
+
+	if got, want := (Matrix{1, 0, 0, 1, 0.5, 2}).PDFOperator(), "1 0 0 1 0.5 2 cm"; got != want {
+		t.Errorf("PDFOperator() = %q, want %q", got, want)
+	}
+}
+
 func closeEnough(a, b float64) bool {
 	if a == b {
 		return true
