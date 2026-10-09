@@ -74,7 +74,7 @@ func SkewY(angleDeg float64) Matrix {
 // PDFOperator returns the PDF content stream operator for this matrix.
 func (m Matrix) PDFOperator() string {
 	return fmt.Sprintf("%s %s %s %s %s %s cm",
-		fmtF(m[0]), fmtF(m[1]), fmtF(m[2]), fmtF(m[3]), fmtF(m[4]), fmtF(m[5]))
+		fmtM(m[0]), fmtM(m[1]), fmtM(m[2]), fmtM(m[3]), fmtM(m[4]), fmtM(m[5]))
 }
 
 // ParseTransform parses an SVG transform attribute value into a combined matrix.
@@ -175,7 +175,17 @@ func parseTransformArgs(s string) []float64 {
 
 // fmtF formats a float64 for PDF output: max 4 decimal places, trailing zeros stripped.
 func fmtF(f float64) string {
-	s := strconv.FormatFloat(f, 'f', 4, 64)
+	return fmtPrec(f, 4)
+}
+
+// fmtM formats a matrix entry with 6 decimal places. A matrix scales every
+// coordinate drawn under it, so its rounding error grows with them.
+func fmtM(f float64) string {
+	return fmtPrec(f, 6)
+}
+
+func fmtPrec(f float64, prec int) string {
+	s := strconv.FormatFloat(f, 'f', prec, 64)
 	if strings.ContainsRune(s, '.') {
 		s = strings.TrimRight(s, "0")
 		s = strings.TrimRight(s, ".")
