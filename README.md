@@ -1,10 +1,10 @@
-[![Explore in Constellation](https://img.shields.io/badge/Explore%20in-Constellation-blue)](https://constellation.speedata.de)
+[![Explore in Constellation](https://img.shields.io/badge/Explore%20in-Constellation-blue)](https://constellation.speedata.de/#svgreader)
 
 # svgreader
 
 A pure Go SVG-to-PDF renderer. Parses SVG documents and produces PDF content streams — no external tools (like Inkscape or librsvg) needed.
 
-> **Status:** Beta. The library is actively used in [boxes and glue](https://github.com/boxesandglue/boxesandglue) for embedding SVG graphics in PDF documents. The API may still change.
+svgreader is used in [boxes and glue](https://github.com/boxesandglue/boxesandglue) for embedding SVG graphics in PDF documents.
 
 ## Features
 
@@ -78,7 +78,7 @@ svgNode := f.Doc.CreateSVGNodeFromDocument(svgDoc, bag.MustSP("80mm"), 0, tr)
 ## Documentation
 
 - [SVG graphics (Go API)](https://boxesandglue.dev/goapi/frontend/svg/) — Using svgreader from Go
-- [SVG graphics (Lua CLI)](https://boxesandglue.dev/cli/#svg-graphics) — Using svgreader from glu
+- [SVG graphics (glu)](https://boxesandglue.dev/glu/frontend/#svgdocument) — Using svgreader from glu's Lua API
 
 ## Text rendering
 
@@ -108,7 +108,7 @@ transform.go  SVG transform parser and matrix math
 
 svgreader is part of a broader ecosystem of PDF, typesetting and publishing technologies.
 
-**[Explore the constellation →](https://constellation.speedata.de)**
+**[Explore the constellation →](https://constellation.speedata.de/#svgreader)**
 
 ## License
 
