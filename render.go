@@ -37,6 +37,30 @@ type ShadingRequest struct {
 	CTM      Matrix
 }
 
+// OpacityRegistrar is implemented by callers to make transparency available.
+// A constant alpha is a graphics state, and the opacity of a group needs a
+// Form XObject with a transparency group, which the renderer cannot write on
+// its own. All names come without a leading slash.
+//
+// BeginGroup and EndGroup nest. What RegisterAlpha and a ShadingRegistrar get
+// between them belongs to the resources of that group. In a group the CTM of a
+// ShadingRequest is relative to the group: a pattern matrix maps to the
+// coordinates of the form that uses the pattern.
+type OpacityRegistrar interface {
+	// RegisterAlpha returns the name of a graphics state with these alpha
+	// values for filling and stroking, both in 0..1. An empty name paints
+	// opaque.
+	RegisterAlpha(fill, stroke float64) string
+	// BeginGroup starts a group. On false there is no EndGroup and the
+	// content is painted without the group, which is what a host does for a
+	// format that forbids transparency.
+	BeginGroup() bool
+	// EndGroup ends a group and returns the name of the form for its
+	// content. bbox is lower left x, lower left y, upper right x, upper
+	// right y in the coordinates of the content.
+	EndGroup(content string, bbox [4]float64) string
+}
+
 // RenderOptions controls PDF rendering.
 type RenderOptions struct {
 	// Width and Height specify the output size in PDF points.
@@ -51,6 +75,10 @@ type RenderOptions struct {
 	// When nil, gradient fills degrade to the first stop's flat color (or
 	// to "no fill" when the gradient has no stops).
 	ShadingRegistrar ShadingRegistrar
+
+	// OpacityRegistrar, if non-nil, receives the alpha values and the groups
+	// of the drawing. When nil, everything is painted opaque.
+	OpacityRegistrar OpacityRegistrar
 }
 
 // RenderPDF renders the SVG document as a PDF content stream.
@@ -58,8 +86,11 @@ type RenderOptions struct {
 // If both are zero, the SVG dimensions are used as-is.
 func (doc *Document) RenderPDF(opts RenderOptions) string {
 	r := &renderer{
-		doc:  doc,
-		opts: opts,
+		doc:         doc,
+		opts:        opts,
+		buf:         &strings.Builder{},
+		formInverse: Identity(),
+		elemOpacity: 1,
 	}
 	return r.render()
 }
@@ -68,7 +99,7 @@ func (doc *Document) RenderPDF(opts RenderOptions) string {
 type renderer struct {
 	doc  *Document
 	opts RenderOptions
-	buf  strings.Builder
+	buf  *strings.Builder
 	// ctmStack mirrors the PDF graphics state stack. Each pushQ() copies
 	// the top onto the stack; popQ() drops the top. The top is always
 	// the current CTM. Needed because PDF Pattern matrices map to the
@@ -76,6 +107,14 @@ type renderer struct {
 	// to a path with a nested transform must bake the surrounding CTM
 	// into the pattern matrix.
 	ctmStack []Matrix
+	// formInverse takes a CTM to the coordinates of the current form.
+	formInverse Matrix
+	// viewport is the visible area in the coordinates of the root: the
+	// BBox of a form must not cut off anything that can be seen.
+	viewport [4]float64
+	// elemOpacity is the opacity of the current shape if a constant alpha
+	// can stand in for it.
+	elemOpacity float64
 }
 
 // pushQ saves the graphics state and duplicates the current CTM onto the
@@ -119,16 +158,18 @@ func (r *renderer) currentCTM() Matrix {
 // defaultStyle returns the SVG default style (black fill, no stroke).
 func defaultStyle() resolvedStyle {
 	return resolvedStyle{
-		fill:          Color{0, 0, 0, false}, // black
-		fillSet:       true,
-		stroke:        Color{IsNone: true},
-		strokeWidth:   1,
-		fillOpacity:   1,
-		strokeOpacity: 1,
-		opacity:       1,
-		linecap:       0, // butt
-		linejoin:      0, // miter
-		fillRule:      "nonzero",
+		fill:             Color{0, 0, 0, false}, // black
+		fillSet:          true,
+		stroke:           Color{IsNone: true},
+		strokeWidth:      1,
+		fillOpacity:      1,
+		strokeOpacity:    1,
+		fillColorAlpha:   1,
+		strokeColorAlpha: 1,
+		opacity:          1,
+		linecap:          0, // butt
+		linejoin:         0, // miter
+		fillRule:         "nonzero",
 	}
 }
 
@@ -142,12 +183,17 @@ type resolvedStyle struct {
 	strokeWidth   float64
 	fillOpacity   float64
 	strokeOpacity float64
-	opacity       float64
-	linecap       int // 0=butt, 1=round, 2=square
-	linejoin      int // 0=miter, 1=round, 2=bevel
-	dashArray     []float64
-	dashOffset    float64
-	fillRule      string
+	// fillColorAlpha and strokeColorAlpha are the alpha values of the paints
+	// themselves, as in rgba(). They go with the paint: a new fill resets
+	// the first one, while fill-opacity stays.
+	fillColorAlpha   float64
+	strokeColorAlpha float64
+	opacity          float64 // not inherited, see mergeStyle
+	linecap          int     // 0=butt, 1=round, 2=square
+	linejoin         int     // 0=miter, 1=round, 2=bevel
+	dashArray        []float64
+	dashOffset       float64
+	fillRule         string
 }
 
 // hasFillPaint reports whether the style produces any fill (flat color or
@@ -156,15 +202,22 @@ type resolvedStyle struct {
 //
 // fill-opacity=0 makes the element invisible: a common SVG idiom for
 // hit-target paths under an opaque graphic. Treating it as no-fill here
-// avoids the alternative — a full ExtGState / SMask plumbing — that
-// would otherwise be needed for general fractional opacity, which we
-// don't yet support.
+// keeps such paths out of the PDF, with or without an OpacityRegistrar.
 func (s resolvedStyle) hasFillPaint() bool {
-	if s.fillOpacity == 0 {
+	if s.fillAlpha() == 0 {
 		return false
 	}
 	return s.fillGradient != nil || !s.fill.IsNone
 }
+
+// hasStrokePaint is hasFillPaint for the stroke.
+func (s resolvedStyle) hasStrokePaint() bool {
+	return s.strokeAlpha() != 0 && !s.stroke.IsNone
+}
+
+func (s resolvedStyle) fillAlpha() float64 { return s.fillOpacity * s.fillColorAlpha }
+
+func (s resolvedStyle) strokeAlpha() float64 { return s.strokeOpacity * s.strokeColorAlpha }
 
 func (r *renderer) render() string {
 	width := r.opts.Width
@@ -177,6 +230,12 @@ func (r *renderer) render() string {
 	}
 
 	vb := r.doc.ViewBox
+
+	// An SVG without any size is drawn unclipped.
+	r.viewport = [4]float64{-16383, -16383, 16383, 16383}
+	if width > 0 && height > 0 {
+		r.viewport = [4]float64{0, -height, width, 0}
+	}
 
 	// Save graphics state
 	r.pushQ()
@@ -208,7 +267,114 @@ func (r *renderer) render() string {
 	return r.buf.String()
 }
 
+// elementStyle returns the style attributes of elem.
+func elementStyle(elem Element) StyleAttrs {
+	switch e := elem.(type) {
+	case Group:
+		return e.Style
+	case Path:
+		return e.Style
+	case Rect:
+		return e.Style
+	case Circle:
+		return e.Style
+	case Ellipse:
+		return e.Style
+	case Line:
+		return e.Style
+	case Polyline:
+		return e.Style
+	case Polygon:
+		return e.Style
+	case Text:
+		return e.Style
+	}
+	return StyleAttrs{}
+}
+
+// renderElement draws elem with its opacity. Opacity applies to an element as
+// a whole. For a single paint a constant alpha gives that result, but children
+// that overlap, or a stroke that overlaps its fill, have to be composited first
+// and need a group.
 func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
+	style := mergeStyle(inherited, elementStyle(elem), r.doc.Defs)
+	if style.opacity == 0 {
+		return
+	}
+	if style.opacity == 1 {
+		r.drawElement(elem, inherited)
+		return
+	}
+	_, isGroup := elem.(Group)
+	if isGroup || (style.hasFillPaint() && style.hasStrokePaint()) {
+		r.drawGroup(style.opacity, func() { r.drawElement(elem, inherited) })
+		return
+	}
+	r.elemOpacity = style.opacity
+	r.drawElement(elem, inherited)
+	r.elemOpacity = 1
+}
+
+// drawGroup paints what draw writes as one object with the given opacity.
+func (r *renderer) drawGroup(opacity float64, draw func()) {
+	reg := r.opts.OpacityRegistrar
+	if reg == nil {
+		draw()
+		return
+	}
+	ctm := r.currentCTM()
+	inverse, ok := ctm.Inverse()
+	if !ok {
+		return // a transformation to nothing
+	}
+	if !reg.BeginGroup() {
+		draw()
+		return
+	}
+	outerBuf, outerInverse := r.buf, r.formInverse
+	r.buf, r.formInverse = &strings.Builder{}, inverse
+	draw()
+	content := r.buf.String()
+	r.buf, r.formInverse = outerBuf, outerInverse
+
+	name := reg.EndGroup(content, r.viewportIn(inverse))
+	if name == "" {
+		return
+	}
+	r.pushQ()
+	r.applyAlpha(opacity, 1)
+	r.emitf("/%s Do", name)
+	r.popQ()
+}
+
+// viewportIn returns the bounding box of the viewport after inverse.
+func (r *renderer) viewportIn(inverse Matrix) [4]float64 {
+	x0, y0 := inverse.TransformPoint(r.viewport[0], r.viewport[1])
+	box := [4]float64{x0, y0, x0, y0}
+	for _, corner := range [][2]float64{
+		{r.viewport[2], r.viewport[1]},
+		{r.viewport[2], r.viewport[3]},
+		{r.viewport[0], r.viewport[3]},
+	} {
+		x, y := inverse.TransformPoint(corner[0], corner[1])
+		box[0], box[1] = min(box[0], x), min(box[1], y)
+		box[2], box[3] = max(box[2], x), max(box[3], y)
+	}
+	return box
+}
+
+// applyAlpha sets the alpha values for what is painted until the next Q.
+func (r *renderer) applyAlpha(fill, stroke float64) {
+	reg := r.opts.OpacityRegistrar
+	if reg == nil || (fill == 1 && stroke == 1) {
+		return
+	}
+	if name := reg.RegisterAlpha(fill, stroke); name != "" {
+		r.emitf("/%s gs", name)
+	}
+}
+
+func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 	switch e := elem.(type) {
 	case Group:
 		r.pushQ()
@@ -307,6 +473,12 @@ func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
 		}
+		alpha := style.fillAlpha() * r.elemOpacity
+		if alpha == 0 {
+			r.popQ()
+			return
+		}
+		r.applyAlpha(alpha, 1)
 		fontFamily := e.FontFamily
 		if fontFamily == "" {
 			fontFamily = r.doc.FontFamily
@@ -441,6 +613,14 @@ func (r *renderer) renderPolyPoints(pts []Point, close bool) {
 
 // applyStyle emits PDF operators for colors, line width, etc.
 func (r *renderer) applyStyle(style resolvedStyle) {
+	fillAlpha, strokeAlpha := 1.0, 1.0
+	if style.hasFillPaint() {
+		fillAlpha = style.fillAlpha() * r.elemOpacity
+	}
+	if style.hasStrokePaint() {
+		strokeAlpha = style.strokeAlpha() * r.elemOpacity
+	}
+	r.applyAlpha(fillAlpha, strokeAlpha)
 	if style.hasFillPaint() {
 		switch {
 		case style.fillGradient != nil:
@@ -454,7 +634,7 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 			if reg := r.opts.ShadingRegistrar; reg != nil {
 				name := reg.RegisterShading(ShadingRequest{
 					Gradient: style.fillGradient,
-					CTM:      r.currentCTM(),
+					CTM:      r.formInverse.Multiply(r.currentCTM()),
 				})
 				if name != "" {
 					r.emit("/Pattern cs")
@@ -473,7 +653,7 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 			r.emit(style.fill.PDFNonstroking())
 		}
 	}
-	if !style.stroke.IsNone {
+	if style.hasStrokePaint() {
 		r.emit(style.stroke.PDFStroking())
 		r.emitf("%s w", fmtF(style.strokeWidth))
 		r.emitf("%d J", style.linecap)
@@ -493,7 +673,7 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 // emitPaintOp emits the appropriate PDF paint operator based on fill/stroke.
 func (r *renderer) emitPaintOp(style resolvedStyle) {
 	hasFill := style.hasFillPaint()
-	hasStroke := !style.stroke.IsNone
+	hasStroke := style.hasStrokePaint()
 
 	switch {
 	case hasFill && hasStroke:
@@ -529,6 +709,8 @@ func (r *renderer) emitf(format string, args ...any) {
 // mergeStyle applies an element's style attributes on top of the inherited style.
 func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearGradient) resolvedStyle {
 	s := parent
+	// Unlike fill-opacity, opacity is not inherited.
+	s.opacity = 1
 
 	if attrs.Fill != "" {
 		paint := resolvePaint(attrs.Fill)
@@ -539,6 +721,7 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearG
 				// Clear any inherited flat fill so applyStyle goes through
 				// the gradient branch.
 				s.fill = Color{IsNone: true}
+				s.fillColorAlpha = 1
 				s.fillSet = true
 			}
 			// Unresolved gradient ref: keep the inherited fill rather than
@@ -546,18 +729,21 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearG
 			// dangling url() refs.
 		case PaintColor:
 			s.fill = paint.Color
+			s.fillColorAlpha = paint.Alpha
 			s.fillGradient = nil
 			s.fillSet = true
 		case PaintNone:
 			s.fill = Color{IsNone: true}
+			s.fillColorAlpha = 1
 			s.fillGradient = nil
 			s.fillSet = true
 		}
 	}
 	if attrs.Stroke != "" {
-		c, err := ParseColor(attrs.Stroke)
+		c, alpha, err := parseColorAlpha(attrs.Stroke)
 		if err == nil {
 			s.stroke = c
+			s.strokeColorAlpha = alpha
 			s.strokeSet = true
 		}
 	}
@@ -566,20 +752,14 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearG
 			s.strokeWidth = w
 		}
 	}
-	if attrs.FillOpacity != "" {
-		if v, err := strconv.ParseFloat(attrs.FillOpacity, 64); err == nil {
-			s.fillOpacity = v
-		}
+	if v, ok := parseOpacity(attrs.FillOpacity); ok {
+		s.fillOpacity = v
 	}
-	if attrs.StrokeOpacity != "" {
-		if v, err := strconv.ParseFloat(attrs.StrokeOpacity, 64); err == nil {
-			s.strokeOpacity = v
-		}
+	if v, ok := parseOpacity(attrs.StrokeOpacity); ok {
+		s.strokeOpacity = v
 	}
-	if attrs.Opacity != "" {
-		if v, err := strconv.ParseFloat(attrs.Opacity, 64); err == nil {
-			s.opacity = v
-		}
+	if v, ok := parseOpacity(attrs.Opacity); ok {
+		s.opacity = v
 	}
 	if attrs.StrokeLinecap != "" {
 		switch attrs.StrokeLinecap {

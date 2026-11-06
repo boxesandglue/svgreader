@@ -41,7 +41,8 @@ const (
 type Paint struct {
 	Kind        PaintKind
 	Color       Color
-	GradientRef string // id of the gradient when Kind == PaintGradient
+	Alpha       float64 // alpha value of Color when Kind == PaintColor
+	GradientRef string  // id of the gradient when Kind == PaintGradient
 }
 
 // resolvePaint converts an SVG paint string ("none", "#rgb", "url(#id)", a
@@ -60,11 +61,11 @@ func resolvePaint(s string) Paint {
 		}
 		return Paint{Kind: PaintGradient, GradientRef: id}
 	}
-	c, err := ParseColor(s)
+	c, alpha, err := parseColorAlpha(s)
 	if err != nil || c.IsNone {
 		return Paint{Kind: PaintNone}
 	}
-	return Paint{Kind: PaintColor, Color: c}
+	return Paint{Kind: PaintColor, Color: c, Alpha: alpha}
 }
 
 // parseDefs consumes a <defs> element's children, extracting gradient

@@ -38,6 +38,23 @@ func (m Matrix) TransformPoint(x, y float64) (float64, float64) {
 	return m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]
 }
 
+// Inverse returns the inverse of m. It reports false for a matrix without one,
+// which maps everything onto a line or a point.
+func (m Matrix) Inverse() (Matrix, bool) {
+	det := m[0]*m[3] - m[1]*m[2]
+	if det == 0 {
+		return Matrix{}, false
+	}
+	return Matrix{
+		m[3] / det,
+		-m[1] / det,
+		-m[2] / det,
+		m[0] / det,
+		(m[2]*m[5] - m[3]*m[4]) / det,
+		(m[1]*m[4] - m[0]*m[5]) / det,
+	}, true
+}
+
 // Translate returns a translation matrix.
 func Translate(tx, ty float64) Matrix {
 	return Matrix{1, 0, 0, 1, tx, ty}
