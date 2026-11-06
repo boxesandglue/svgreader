@@ -15,6 +15,7 @@ type fakeRegistrar struct {
 	depth    int
 	refuse   bool
 	shadings []ShadingRequest
+	masks    []GradientMask
 }
 
 func (f *fakeRegistrar) RegisterAlpha(fill, stroke float64) string {
@@ -36,6 +37,11 @@ func (f *fakeRegistrar) EndGroup(content string, bbox [4]float64) string {
 	f.groups = append(f.groups, content)
 	f.boxes = append(f.boxes, bbox)
 	return fmt.Sprintf("Fm%d", len(f.groups))
+}
+
+func (f *fakeRegistrar) RegisterGradientMask(mask GradientMask) string {
+	f.masks = append(f.masks, mask)
+	return "Mask"
 }
 
 func (f *fakeRegistrar) RegisterShading(req ShadingRequest) string {
@@ -279,5 +285,121 @@ func TestParseColorAlpha(t *testing.T) {
 		if err == nil && (math.Abs(c.R-td.r) > 1e-9 || math.Abs(alpha-td.alpha) > 1e-9) {
 			t.Errorf("%s: R %g alpha %g, want %g, %g", td.in, c.R, alpha, td.r, td.alpha)
 		}
+	}
+}
+
+const fadingGradient = `<defs><linearGradient id="g"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#f00" stop-opacity="0"/></linearGradient></defs>`
+
+func TestStopOpacityUsesAMask(t *testing.T) {
+	reg := &fakeRegistrar{}
+	out := renderSVG(t, fadingGradient+`<g transform="translate(10,20)"><rect width="9" height="9" fill="url(#g)"/></g>`, reg)
+	if len(reg.masks) != 1 {
+		t.Fatalf("masks = %d, want 1", len(reg.masks))
+	}
+	if !strings.Contains(out, "/Mask gs\n/Pattern cs\n/Sh1 scn") {
+		t.Errorf("the mask is not set in\n%s", out)
+	}
+	// The box is the viewport in the coordinates that set the mask.
+	want := [4]float64{-10, -20, 90, 80}
+	if reg.masks[0].BBox != want {
+		t.Errorf("bbox = %v, want %v", reg.masks[0].BBox, want)
+	}
+}
+
+// TestUniformStopOpacity: the same opacity everywhere needs no soft mask.
+func TestUniformStopOpacity(t *testing.T) {
+	reg := &fakeRegistrar{}
+	renderSVG(t, `<defs><linearGradient id="g"><stop offset="0" stop-color="#f00" stop-opacity="0.5"/><stop offset="1" stop-color="#00f" style="stop-opacity:50%"/></linearGradient></defs>
+		<rect width="9" height="9" fill="url(#g)"/>`, reg)
+	if len(reg.masks) != 0 {
+		t.Errorf("masks = %d, want none", len(reg.masks))
+	}
+	if len(reg.alpha) != 1 || reg.alpha[0] != "A0.5_1" {
+		t.Errorf("alpha = %v", reg.alpha)
+	}
+}
+
+// TestMaskTakesTheAlpha: MuPDF counts a constant alpha next to a soft mask
+// twice, so the mask carries it and there is no second graphics state.
+func TestMaskTakesTheAlpha(t *testing.T) {
+	reg := &fakeRegistrar{}
+	out := renderSVG(t, fadingGradient+`<rect width="9" height="9" fill="url(#g)" fill-opacity="0.5" opacity="0.5"/>`, reg)
+	if len(reg.masks) != 1 || reg.masks[0].Opacity != 0.25 {
+		t.Fatalf("masks = %+v, want one with opacity 0.25", reg.masks)
+	}
+	if len(reg.alpha) != 0 || !strings.Contains(out, "/Mask gs") {
+		t.Errorf("alpha = %v in\n%s", reg.alpha, out)
+	}
+}
+
+// TestStrokeKeepsItsAlpha: the stroke is no part of the mask.
+func TestStrokeKeepsItsAlpha(t *testing.T) {
+	reg := &fakeRegistrar{}
+	renderSVG(t, fadingGradient+`<rect width="9" height="9" fill="url(#g)" fill-opacity="0.5" stroke="#00f" stroke-opacity="0.25"/>`, reg)
+	if len(reg.alpha) != 1 || reg.alpha[0] != "A1_0.25" {
+		t.Errorf("alpha = %v, want only the one of the stroke", reg.alpha)
+	}
+	if len(reg.masks) != 1 || reg.masks[0].Opacity != 0.5 {
+		t.Errorf("masks = %+v", reg.masks)
+	}
+}
+
+func TestInvisibleGradient(t *testing.T) {
+	reg := &fakeRegistrar{}
+	out := renderSVG(t, `<defs><linearGradient id="g"><stop offset="0" stop-color="transparent"/><stop offset="1" stop-color="rgba(0,0,0,0)"/></linearGradient></defs>
+		<rect width="9" height="9" fill="url(#g)"/>`, reg)
+	if strings.Contains(out, "scn") || len(reg.shadings) != 0 {
+		t.Errorf("an invisible gradient is painted:\n%s", out)
+	}
+}
+
+func TestStopColorAlpha(t *testing.T) {
+	reg := &fakeRegistrar{}
+	renderSVG(t, `<defs><linearGradient id="g"><stop offset="0" stop-color="rgba(255,0,0,.5)" stop-opacity="0.5"/><stop offset="1" stop-color="#f00"/></linearGradient></defs>
+		<rect width="9" height="9" fill="url(#g)"/>`, reg)
+	if len(reg.masks) != 1 {
+		t.Fatalf("masks = %d, want 1", len(reg.masks))
+	}
+	if got := reg.masks[0].Gradient.Stops[0].StopOpacity; got != 0.25 {
+		t.Errorf("opacity of the stop = %g, want 0.25", got)
+	}
+}
+
+// TestMaskKeepsStrokeOut: a soft mask applies to all that is painted, so the
+// stroke is painted on its own. A single B operator would fade it as well.
+func TestMaskKeepsStrokeOut(t *testing.T) {
+	reg := &fakeRegistrar{}
+	out := renderSVG(t, fadingGradient+`<rect width="9" height="9" fill="url(#g)" stroke="#00f" stroke-width="2"/>`, reg)
+	fill := strings.Index(out, "\nf\n")
+	stroke := strings.Index(out, "\nS\n")
+	mask := strings.Index(out, "/Mask gs")
+	if strings.Contains(out, "\nB\n") || fill < 0 || stroke < fill || mask < 0 || mask > fill {
+		t.Fatalf("fill and stroke are not separate:\n%s", out)
+	}
+	if end := strings.Index(out[fill:], "\nQ\n"); end < 0 || fill+end > stroke {
+		t.Errorf("the stroke is inside of the mask:\n%s", out)
+	}
+}
+
+// TestMaskInOpacityGroup: the mask belongs to the content of the group.
+func TestMaskInOpacityGroup(t *testing.T) {
+	reg := &fakeRegistrar{}
+	renderSVG(t, fadingGradient+`<g opacity="0.5"><rect width="9" height="9" fill="url(#g)"/></g>`, reg)
+	if len(reg.groups) != 1 || !strings.Contains(reg.groups[0], "/Mask gs") {
+		t.Errorf("groups: %v", reg.groups)
+	}
+}
+
+// TestWithoutMaskRegistrar paints the gradient opaque, as before.
+func TestWithoutMaskRegistrar(t *testing.T) {
+	src := `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">` + fadingGradient +
+		`<rect width="9" height="9" fill="url(#g)" stroke="#00f"/></svg>`
+	doc, err := Parse(strings.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := doc.RenderPDF(RenderOptions{ShadingRegistrar: &fakeRegistrar{}})
+	if !strings.Contains(out, "\nB\n") {
+		t.Errorf("without a registrar the shape is one operator:\n%s", out)
 	}
 }

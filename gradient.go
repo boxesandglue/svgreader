@@ -25,6 +25,21 @@ type GradientStop struct {
 	StopOpacity float64 // 1 = opaque
 }
 
+// uniformOpacity returns the opacity of the stops if it is the same for all of
+// them, so that a constant alpha can stand in for a soft mask.
+func (g *LinearGradient) uniformOpacity() (float64, bool) {
+	if len(g.Stops) == 0 {
+		return 1, true
+	}
+	opacity := g.Stops[0].StopOpacity
+	for _, stop := range g.Stops[1:] {
+		if stop.StopOpacity != opacity {
+			return 0, false
+		}
+	}
+	return opacity, true
+}
+
 // PaintKind discriminates a paint between "no fill", a flat color, and a
 // gradient reference. Distinguishing the three at parse time keeps the
 // renderer's mergeStyle free of url(#…) string inspection.
@@ -169,7 +184,7 @@ func parseStop(start xml.StartElement) (GradientStop, bool) {
 		case "stop-color":
 			stopColorAttr = a.Value
 		case "stop-opacity":
-			if v, err := strconv.ParseFloat(strings.TrimSpace(a.Value), 64); err == nil {
+			if v, ok := parseOpacity(a.Value); ok {
 				stop.StopOpacity = v
 			}
 		case "style":
@@ -190,7 +205,7 @@ func parseStop(start xml.StartElement) (GradientStop, bool) {
 			case "stop-color":
 				stopColorAttr = val
 			case "stop-opacity":
-				if v, err := strconv.ParseFloat(val, 64); err == nil {
+				if v, ok := parseOpacity(val); ok {
 					stop.StopOpacity = v
 				}
 			}
@@ -199,11 +214,15 @@ func parseStop(start xml.StartElement) (GradientStop, bool) {
 	if stopColorAttr == "" {
 		stopColorAttr = "#000000"
 	}
-	c, err := ParseColor(stopColorAttr)
+	c, alpha, err := parseColorAlpha(stopColorAttr)
 	if err != nil {
 		return GradientStop{}, false
 	}
+	if strings.EqualFold(strings.TrimSpace(stopColorAttr), "transparent") {
+		alpha = 0
+	}
 	stop.Color = c
+	stop.StopOpacity *= alpha
 	return stop, true
 }
 

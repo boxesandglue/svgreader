@@ -59,6 +59,21 @@ type OpacityRegistrar interface {
 	// content. bbox is lower left x, lower left y, upper right x, upper
 	// right y in the coordinates of the content.
 	EndGroup(content string, bbox [4]float64) string
+	// RegisterGradientMask returns the name of a graphics state with a soft
+	// mask for a gradient whose stops differ in opacity. An empty name
+	// paints the gradient opaque.
+	RegisterGradientMask(mask GradientMask) string
+}
+
+// GradientMask asks for a soft mask with the opacity of the stops of Gradient.
+// The coordinates of a soft mask are those at the time its graphics state is
+// set, so the gradient needs no CTM here, unlike a ShadingRequest. BBox is
+// lower left x, lower left y, upper right x, upper right y in these coordinates
+// and covers the viewport.
+type GradientMask struct {
+	Gradient *LinearGradient
+	Opacity  float64 // applies to all stops, for fill-opacity and the like
+	BBox     [4]float64
 }
 
 // RenderOptions controls PDF rendering.
@@ -115,7 +130,18 @@ type renderer struct {
 	// elemOpacity is the opacity of the current shape if a constant alpha
 	// can stand in for it.
 	elemOpacity float64
+	// only restricts the painting to one part of a shape.
+	only paintPart
 }
+
+// paintPart selects what a shape paints.
+type paintPart int
+
+const (
+	paintAll paintPart = iota
+	paintFill
+	paintStroke
+)
 
 // pushQ saves the graphics state and duplicates the current CTM onto the
 // stack so subsequent transforms accumulate into a new top.
@@ -215,7 +241,24 @@ func (s resolvedStyle) hasStrokePaint() bool {
 	return s.strokeAlpha() != 0 && !s.stroke.IsNone
 }
 
-func (s resolvedStyle) fillAlpha() float64 { return s.fillOpacity * s.fillColorAlpha }
+func (s resolvedStyle) fillAlpha() float64 {
+	alpha := s.fillOpacity * s.fillColorAlpha
+	if s.fillGradient != nil {
+		if opacity, uniform := s.fillGradient.uniformOpacity(); uniform {
+			alpha *= opacity
+		}
+	}
+	return alpha
+}
+
+// hasFillMask reports whether the fill is a gradient that needs a soft mask.
+func (s resolvedStyle) hasFillMask() bool {
+	if s.fillGradient == nil {
+		return false
+	}
+	_, uniform := s.fillGradient.uniformOpacity()
+	return !uniform
+}
 
 func (s resolvedStyle) strokeAlpha() float64 { return s.strokeOpacity * s.strokeColorAlpha }
 
@@ -302,17 +345,70 @@ func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 		return
 	}
 	if style.opacity == 1 {
-		r.drawElement(elem, inherited)
+		r.drawParts(elem, inherited, style)
 		return
 	}
 	_, isGroup := elem.(Group)
 	if isGroup || (style.hasFillPaint() && style.hasStrokePaint()) {
-		r.drawGroup(style.opacity, func() { r.drawElement(elem, inherited) })
+		r.drawGroup(style.opacity, func() { r.drawParts(elem, inherited, style) })
 		return
 	}
 	r.elemOpacity = style.opacity
-	r.drawElement(elem, inherited)
+	r.drawParts(elem, inherited, style)
 	r.elemOpacity = 1
+}
+
+// drawParts draws elem. A soft mask applies to everything that is painted, so
+// a stroke has to stay out of the one for its fill.
+func (r *renderer) drawParts(elem Element, inherited, style resolvedStyle) {
+	_, isGroup := elem.(Group)
+	if isGroup || r.opts.OpacityRegistrar == nil || !style.hasFillMask() || !style.hasStrokePaint() {
+		r.drawElement(elem, inherited)
+		return
+	}
+	r.only = paintFill
+	r.drawElement(elem, inherited)
+	r.only = paintStroke
+	r.drawElement(elem, inherited)
+	r.only = paintAll
+}
+
+// paintStyle is the style of a shape with what it must not paint removed.
+func (r *renderer) paintStyle(inherited resolvedStyle, attrs StyleAttrs) resolvedStyle {
+	style := mergeStyle(inherited, attrs, r.doc.Defs)
+	switch r.only {
+	case paintFill:
+		style.stroke = Color{IsNone: true}
+	case paintStroke:
+		style.fill = Color{IsNone: true}
+		style.fillGradient = nil
+	}
+	return style
+}
+
+// applyFillMask sets the soft mask for the stops of a gradient fill until the
+// next Q and reports whether there is one. The mask takes the constant alpha
+// of the fill as well. A constant alpha next to a soft mask is valid PDF, but
+// MuPDF counts it twice for a fill.
+func (r *renderer) applyFillMask(style resolvedStyle, alpha float64) bool {
+	reg := r.opts.OpacityRegistrar
+	if reg == nil || r.opts.ShadingRegistrar == nil || !style.hasFillMask() {
+		return false
+	}
+	inverse, ok := r.currentCTM().Inverse()
+	if !ok {
+		return false
+	}
+	name := reg.RegisterGradientMask(GradientMask{
+		Gradient: style.fillGradient,
+		Opacity:  alpha,
+		BBox:     r.viewportIn(inverse),
+	})
+	if name == "" {
+		return false
+	}
+	r.emitf("/%s gs", name)
+	return true
 }
 
 // drawGroup paints what draw writes as one object with the given opacity.
@@ -381,7 +477,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		for _, child := range e.Children {
 			r.renderElement(child, style)
 		}
@@ -392,7 +488,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderPath(e.D, style)
 		r.popQ()
@@ -402,7 +498,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderRect(e, style)
 		r.popQ()
@@ -412,7 +508,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.R, e.R, style)
 		r.popQ()
@@ -422,7 +518,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.Rx, e.Ry, style)
 		r.popQ()
@@ -432,7 +528,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.emitf("%s %s m %s %s l", fmtF(e.X1), fmtF(e.Y1), fmtF(e.X2), fmtF(e.Y2))
 		r.emitPaintOp(style)
@@ -443,7 +539,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, false)
 		r.emitPaintOp(style)
@@ -454,7 +550,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, true)
 		r.emitPaintOp(style)
@@ -468,7 +564,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := mergeStyle(inherited, e.Style, r.doc.Defs)
+		style := r.paintStyle(inherited, e.Style)
 		fillColor := style.fill
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
@@ -619,6 +715,9 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 	}
 	if style.hasStrokePaint() {
 		strokeAlpha = style.strokeAlpha() * r.elemOpacity
+	}
+	if style.hasFillPaint() && r.applyFillMask(style, fillAlpha) {
+		fillAlpha = 1
 	}
 	r.applyAlpha(fillAlpha, strokeAlpha)
 	if style.hasFillPaint() {

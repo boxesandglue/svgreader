@@ -12,7 +12,7 @@ svgreader is used in [boxes and glue](https://github.com/boxesandglue/boxesandgl
 - **Paths**: All SVG path commands (M, L, H, V, C, S, Q, T, A, Z), with arc-to-cubic conversion
 - **Groups**: `<g>` with style inheritance
 - **Transforms**: `translate()`, `rotate()`, `scale()`, `matrix()`, `skewX()`, `skewY()`
-- **Styling**: `fill`, `stroke`, `stroke-width`, `stroke-linecap`, `stroke-linejoin`, `fill-rule`, `opacity`, `fill-opacity`, `stroke-opacity`; inline CSS via the `style` attribute
+- **Styling**: `fill`, `stroke`, `stroke-width`, `stroke-linecap`, `stroke-linejoin`, `fill-rule`, `opacity`, `fill-opacity`, `stroke-opacity`, `stop-opacity`; inline CSS via the `style` attribute
 - **Colors**: Hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()` and `rgba()` functions, 148 named CSS colors
 - **Text**: `<text>` elements via a pluggable `TextRenderer` interface for external font shaping
 - **Aspect ratio**: Automatic scaling from viewBox to output size, with aspect-ratio preservation
