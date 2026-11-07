@@ -264,3 +264,36 @@ func TestTextInheritsFontFromGroup(t *testing.T) {
 		t.Errorf("root text: got family %q size %v, want serif 12", root.FontFamily, root.FontSize)
 	}
 }
+
+// TestDocumentSize: a side that is not given follows from the other one and
+// the aspect ratio of the viewBox. A percentage refers to the container, so it
+// tells nothing about the image and counts as not given.
+func TestDocumentSize(t *testing.T) {
+	tests := []struct {
+		name          string
+		attributes    string
+		width, height float64
+	}{
+		{"both", `width="30" height="20" viewBox="0 0 100 50"`, 30, 20},
+		{"width", `width="100pt" viewBox="0 0 200 50"`, 100, 25},
+		{"height", `height="100" viewBox="0 0 200 50"`, 400, 100},
+		{"viewBox only", `viewBox="10 10 200 50"`, 200, 50},
+		{"percent width", `width="100%" viewBox="0 0 200 50"`, 200, 50},
+		{"percent both", `width="100%" height="100%" viewBox="0 0 200 50"`, 200, 50},
+		{"percent width with height", `width="100%" height="25" viewBox="0 0 200 50"`, 100, 25},
+		{"no viewBox", `width="30" height="20"`, 30, 20},
+		{"width without viewBox", `width="30"`, 30, 0},
+		{"nothing", ``, 0, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse(strings.NewReader(`<svg xmlns="http://www.w3.org/2000/svg" ` + tc.attributes + `></svg>`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if doc.Width != tc.width || doc.Height != tc.height {
+				t.Errorf("size = %g x %g, want %g x %g", doc.Width, doc.Height, tc.width, tc.height)
+			}
+		})
+	}
+}

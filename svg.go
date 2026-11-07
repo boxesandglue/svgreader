@@ -206,9 +206,9 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 	for _, attr := range start.Attr {
 		switch attr.Name.Local {
 		case "width":
-			doc.Width = parseDimension(attr.Value)
+			doc.Width = parseSize(attr.Value)
 		case "height":
-			doc.Height = parseDimension(attr.Value)
+			doc.Height = parseSize(attr.Value)
 		case "viewBox":
 			doc.ViewBox = parseViewBox(attr.Value)
 		case "font-family":
@@ -220,10 +220,16 @@ func parseSVG(dec *xml.Decoder, start xml.StartElement) (*Document, error) {
 	if doc.ViewBox.Width == 0 && doc.Width > 0 {
 		doc.ViewBox = ViewBox{Width: doc.Width, Height: doc.Height}
 	}
-	// If no width/height, derive from viewBox
-	if doc.Width == 0 && doc.ViewBox.Width > 0 {
-		doc.Width = doc.ViewBox.Width
-		doc.Height = doc.ViewBox.Height
+	// A side that is not given follows from the viewBox, like its aspect
+	// ratio from the other side.
+	vb := doc.ViewBox
+	switch {
+	case doc.Width == 0 && doc.Height == 0:
+		doc.Width, doc.Height = vb.Width, vb.Height
+	case doc.Width == 0 && vb.Height > 0:
+		doc.Width = doc.Height * vb.Width / vb.Height
+	case doc.Height == 0 && vb.Width > 0:
+		doc.Height = doc.Width * vb.Height / vb.Width
 	}
 
 	elements, err := parseChildren(dec, doc, textAttrs{}.inherit(attrMap(start.Attr)))
@@ -504,6 +510,15 @@ func parseDimension(s string) float64 {
 	}
 	f, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	return f
+}
+
+// parseSize parses the width or height of the svg element. A percentage refers
+// to the container and tells nothing about the image, so it counts as not set.
+func parseSize(s string) float64 {
+	if strings.HasSuffix(strings.TrimSpace(s), "%") {
+		return 0
+	}
+	return parseDimension(s)
 }
 
 func parseViewBox(s string) ViewBox {
