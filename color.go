@@ -2,6 +2,7 @@ package svgreader
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -18,7 +19,8 @@ var colorNone = Color{IsNone: true}
 // ParseColor parses an SVG color value. An alpha value in s is parsed and
 // dropped, see parseColorAlpha.
 // Supported formats: "none", "#rgb", "#rgba", "#rrggbb", "#rrggbbaa",
-// "rgb(r,g,b)", "rgba(r,g,b,a)", "rgb(r g b / a)", named colors.
+// "rgb(r,g,b)", "rgba(r,g,b,a)", "rgb(r g b / a)", "hsl(h,s,l)",
+// "hsla(h,s,l,a)", "hsl(h s l / a)", named colors.
 func ParseColor(s string) (Color, error) {
 	c, _, err := parseColorAlpha(s)
 	return c, err
@@ -40,6 +42,9 @@ func parseColorAlpha(s string) (Color, float64, error) {
 	lower := strings.ToLower(s)
 	if strings.HasPrefix(lower, "rgb(") || strings.HasPrefix(lower, "rgba(") {
 		return parseRGBFunc(lower)
+	}
+	if strings.HasPrefix(lower, "hsl(") || strings.HasPrefix(lower, "hsla(") {
+		return parseHSLFunc(lower)
 	}
 
 	if c, ok := namedColors[lower]; ok {
@@ -75,9 +80,9 @@ func parseHexColor(s string) (Color, float64, error) {
 	return Color{R: float64(r) / 255, G: float64(g) / 255, B: float64(b) / 255}, alpha, nil
 }
 
-// parseRGBFunc parses the commas and the spaces of rgb() and rgba(), the two
-// functions are aliases in CSS.
-func parseRGBFunc(s string) (Color, float64, error) {
+// colorFuncArguments splits the commas and the spaces of a color function into
+// its three components and the alpha value, 1 without one.
+func colorFuncArguments(s string) ([]string, float64, error) {
 	_, s, _ = strings.Cut(s, "(")
 	s = strings.TrimSuffix(s, ")")
 	s, alphaText, _ := strings.Cut(s, "/")
@@ -87,7 +92,76 @@ func parseRGBFunc(s string) (Color, float64, error) {
 		parts = parts[:3]
 	}
 	if len(parts) != 3 {
-		return colorNone, 1, fmt.Errorf("svgreader: invalid rgb() color")
+		return nil, 1, fmt.Errorf("svgreader: invalid color function")
+	}
+	alpha := 1.0
+	if alphaText != "" {
+		a, ok := parseOpacity(alphaText)
+		if !ok {
+			return nil, 1, fmt.Errorf("svgreader: invalid alpha value %q", alphaText)
+		}
+		alpha = a
+	}
+	return parts, alpha, nil
+}
+
+// parseHue reads an angle with the units of CSS, a number means degrees.
+func parseHue(s string) (float64, error) {
+	scale := 1.0
+	for _, unit := range []struct {
+		suffix string
+		scale  float64
+	}{{"deg", 1}, {"grad", 0.9}, {"rad", 180 / math.Pi}, {"turn", 360}} {
+		if bare, ok := strings.CutSuffix(s, unit.suffix); ok {
+			s, scale = bare, unit.scale
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	v = math.Mod(v*scale, 360)
+	if v < 0 {
+		v += 360
+	}
+	return v, nil
+}
+
+// parseHSLFunc parses hsl() and hsla(), the two functions are aliases in CSS.
+// See CSS Color 4 section 7.1 for the conversion.
+func parseHSLFunc(s string) (Color, float64, error) {
+	parts, alpha, err := colorFuncArguments(s)
+	if err != nil {
+		return colorNone, 1, err
+	}
+	hue, err := parseHue(parts[0])
+	if err != nil {
+		return colorNone, 1, err
+	}
+	saturation, err := strconv.ParseFloat(strings.TrimSuffix(parts[1], "%"), 64)
+	if err != nil {
+		return colorNone, 1, err
+	}
+	lightness, err := strconv.ParseFloat(strings.TrimSuffix(parts[2], "%"), 64)
+	if err != nil {
+		return colorNone, 1, err
+	}
+	saturation = max(0, min(saturation/100, 1))
+	lightness = max(0, min(lightness/100, 1))
+	channel := func(n float64) float64 {
+		k := math.Mod(n+hue/30, 12)
+		a := saturation * min(lightness, 1-lightness)
+		return lightness - a*max(-1, min(k-3, 9-k, 1))
+	}
+	return Color{R: channel(0), G: channel(8), B: channel(4)}, alpha, nil
+}
+
+// parseRGBFunc parses rgb() and rgba(), the two functions are aliases in CSS.
+func parseRGBFunc(s string) (Color, float64, error) {
+	parts, alpha, err := colorFuncArguments(s)
+	if err != nil {
+		return colorNone, 1, err
 	}
 
 	vals := [3]float64{}
@@ -105,14 +179,6 @@ func parseRGBFunc(s string) (Color, float64, error) {
 			}
 			vals[i] = v / 255
 		}
-	}
-	alpha := 1.0
-	if alphaText != "" {
-		a, ok := parseOpacity(alphaText)
-		if !ok {
-			return colorNone, 1, fmt.Errorf("svgreader: invalid alpha value %q", alphaText)
-		}
-		alpha = a
 	}
 	return Color{R: vals[0], G: vals[1], B: vals[2]}, alpha, nil
 }

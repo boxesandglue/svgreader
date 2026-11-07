@@ -13,7 +13,8 @@ import (
 type TextRenderer interface {
 	// RenderText returns PDF operators to render text at the given position.
 	// fontSize is in PDF points. textAnchor is "start", "middle", or "end".
-	// The returned string is inserted into the content stream as-is.
+	// The returned string is inserted into the content stream as-is. If
+	// fill.IsNone is set, the color is already selected.
 	RenderText(text string, x, y, fontSize float64, fontFamily, fontWeight, fontStyle, textAnchor string, fill Color) string
 }
 
@@ -80,6 +81,15 @@ type GradientMask struct {
 	BBox     [4]float64
 }
 
+// HostColor is a color from the host document, ready for the content stream.
+type HostColor struct {
+	// Fill and Stroke are the PDF operators that select the color. Any
+	// resource they need is the business of the host. They hold no alpha
+	// value, and their graphics state ends with the shape.
+	Fill, Stroke string
+	Alpha        float64 // alpha value of the color
+}
+
 // RenderOptions controls PDF rendering.
 type RenderOptions struct {
 	// Width and Height specify the output size in PDF points.
@@ -98,6 +108,12 @@ type RenderOptions struct {
 	// OpacityRegistrar, if non-nil, receives the alpha values and the groups
 	// of the drawing. When nil, everything is painted opaque.
 	OpacityRegistrar OpacityRegistrar
+
+	// ResolveColor, if non-nil, is asked first for every color of a fill or a
+	// stroke, so that the host can bring in the colors of its document. It
+	// answers false for a color that it leaves to the renderer. The stops of
+	// a gradient do not get here, as a shading needs numbers in RGB.
+	ResolveColor func(value string) (HostColor, bool)
 
 	// Warn, if non-nil, receives a message for what the drawing asks for and
 	// the renderer cannot do. Each message comes once per rendering.
@@ -216,12 +232,16 @@ type resolvedStyle struct {
 	fillGradient *Gradient // set when fill="url(#id)" resolves
 	// fillMatrix takes the coordinates of fillGradient to user space. It is
 	// set by paintStyle, as it depends on the shape.
-	fillMatrix    Matrix
-	stroke        Color
-	strokeSet     bool
-	strokeWidth   float64
-	fillOpacity   float64
-	strokeOpacity float64
+	fillMatrix Matrix
+	stroke     Color
+	strokeSet  bool
+	// fillOperators and strokeOperators select a color of the host. They go
+	// with the paint and win over fill and stroke.
+	fillOperators   string
+	strokeOperators string
+	strokeWidth     float64
+	fillOpacity     float64
+	strokeOpacity   float64
 	// fillColorAlpha and strokeColorAlpha are the alpha values of the paints
 	// themselves, as in rgba(). They go with the paint: a new fill resets
 	// the first one, while fill-opacity stays.
@@ -354,7 +374,7 @@ func elementStyle(elem Element) StyleAttrs {
 // and need a group.
 func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
 	r.checkPaints(elem)
-	style := mergeStyle(inherited, elementStyle(elem), r.doc.Defs)
+	style := r.mergeStyle(inherited, elementStyle(elem))
 	if style.opacity == 0 {
 		return
 	}
@@ -410,12 +430,50 @@ func (r *renderer) checkPaints(elem Element) {
 	if paint := resolvePaint(attrs.Stroke); paint.Kind == PaintGradient {
 		r.warn(fmt.Sprintf("SVG: a gradient is not supported for a stroke: %s", paint.GradientRef))
 	}
+	r.checkColor(attrs.Fill)
+	r.checkColor(attrs.Stroke)
+	if g, ok := r.doc.Defs[resolvePaint(attrs.Fill).GradientRef]; ok {
+		for _, stop := range g.Stops {
+			r.checkStop(g, stop)
+		}
+	}
+}
+
+// checkColor warns about a paint that neither the host nor the renderer knows.
+func (r *renderer) checkColor(value string) {
+	if resolvePaint(value).Kind != PaintUnknown {
+		return
+	}
+	if _, ok := r.hostColor(value); !ok {
+		r.warn(fmt.Sprintf("SVG: unknown color: %s", strings.TrimSpace(value)))
+	}
+}
+
+// checkStop warns about a stop of g that is black because of its color.
+func (r *renderer) checkStop(g *Gradient, stop GradientStop) {
+	if stop.unknownColor == "" {
+		return
+	}
+	if _, ok := r.hostColor(stop.unknownColor); ok {
+		r.warn(fmt.Sprintf("SVG: a color of the document is not supported in a gradient: %s", stop.unknownColor))
+		return
+	}
+	r.warn(fmt.Sprintf("SVG: unknown color: %s", stop.unknownColor))
+}
+
+// hostColor asks the host for the color value.
+func (r *renderer) hostColor(value string) (HostColor, bool) {
+	value = strings.TrimSpace(value)
+	if r.opts.ResolveColor == nil || value == "" || strings.HasPrefix(value, "url(") {
+		return HostColor{}, false
+	}
+	return r.opts.ResolveColor(value)
 }
 
 // paintStyle is the style of the shape elem with what it must not paint
 // removed.
 func (r *renderer) paintStyle(inherited resolvedStyle, attrs StyleAttrs, elem Element) resolvedStyle {
-	style := mergeStyle(inherited, attrs, r.doc.Defs)
+	style := r.mergeStyle(inherited, attrs)
 	switch r.only {
 	case paintFill:
 		style.stroke = Color{IsNone: true}
@@ -625,12 +683,18 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
 		}
+		if style.fillOperators != "" {
+			fillColor = colorNone
+		}
 		alpha := style.fillAlpha() * r.elemOpacity
 		if alpha == 0 {
 			r.popQ()
 			return
 		}
 		r.applyAlpha(alpha, 1)
+		if style.fillOperators != "" {
+			r.emit(style.fillOperators)
+		}
 		fontFamily := e.FontFamily
 		if fontFamily == "" {
 			fontFamily = r.doc.FontFamily
@@ -825,12 +889,18 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 			if !emitted && len(style.fillGradient.Stops) > 0 {
 				r.emit(style.fillGradient.Stops[0].Color.PDFNonstroking())
 			}
+		case style.fillOperators != "":
+			r.emit(style.fillOperators)
 		case !style.fill.IsNone:
 			r.emit(style.fill.PDFNonstroking())
 		}
 	}
 	if style.hasStrokePaint() {
-		r.emit(style.stroke.PDFStroking())
+		if style.strokeOperators != "" {
+			r.emit(style.strokeOperators)
+		} else {
+			r.emit(style.stroke.PDFStroking())
+		}
 		r.emitf("%s w", fmtF(style.strokeWidth))
 		r.emitf("%d J", style.linecap)
 		r.emitf("%d j", style.linejoin)
@@ -883,13 +953,23 @@ func (r *renderer) emitf(format string, args ...any) {
 }
 
 // mergeStyle applies an element's style attributes on top of the inherited style.
-func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*Gradient) resolvedStyle {
+func (r *renderer) mergeStyle(parent resolvedStyle, attrs StyleAttrs) resolvedStyle {
+	defs := r.doc.Defs
 	s := parent
 	// Unlike fill-opacity, opacity is not inherited.
 	s.opacity = 1
 
-	if attrs.Fill != "" {
+	if host, ok := r.hostColor(attrs.Fill); ok {
+		s.fill = Color{}
+		s.fillOperators = host.Fill
+		s.fillColorAlpha = host.Alpha
+		s.fillGradient = nil
+		s.fillSet = true
+	} else if attrs.Fill != "" {
 		paint := resolvePaint(attrs.Fill)
+		if paint.Kind != PaintInherit && paint.Kind != PaintUnknown {
+			s.fillOperators = ""
+		}
 		switch paint.Kind {
 		case PaintGradient:
 			if g, ok := defs[paint.GradientRef]; ok {
@@ -920,10 +1000,16 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*Gradien
 			s.fillSet = true
 		}
 	}
-	if attrs.Stroke != "" {
+	if host, ok := r.hostColor(attrs.Stroke); ok {
+		s.stroke = Color{}
+		s.strokeOperators = host.Stroke
+		s.strokeColorAlpha = host.Alpha
+		s.strokeSet = true
+	} else if attrs.Stroke != "" {
 		c, alpha, err := parseColorAlpha(attrs.Stroke)
 		if err == nil {
 			s.stroke = c
+			s.strokeOperators = ""
 			s.strokeColorAlpha = alpha
 			s.strokeSet = true
 		}

@@ -14,7 +14,7 @@ svgreader is used in [boxes and glue](https://github.com/boxesandglue/boxesandgl
 - **Transforms**: `translate()`, `rotate()`, `scale()`, `matrix()`, `skewX()`, `skewY()`
 - **Styling**: `fill`, `stroke`, `stroke-width`, `stroke-linecap`, `stroke-linejoin`, `fill-rule`, `opacity`, `fill-opacity`, `stroke-opacity`, `stop-opacity`; inline CSS via the `style` attribute
 - **Gradients**: `<linearGradient>` and `<radialGradient>` as a fill, in `objectBoundingBox` and `userSpaceOnUse` units, with `gradientTransform`; not yet on strokes and text, and without `spreadMethod` and `href`
-- **Colors**: Hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()` and `rgba()` functions, 148 named CSS colors
+- **Colors**: Hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()`, `rgba()`, `hsl()` and `hsla()` functions, 148 named CSS colors, and the colors of the host document through `RenderOptions.ResolveColor`. A value that cannot be read counts as not given and writes a warning, as in a browser
 - **Text**: `<text>` elements via a pluggable `TextRenderer` interface for external font shaping
 - **Aspect ratio**: Automatic scaling from viewBox to output size, with aspect-ratio preservation
 
@@ -101,7 +101,7 @@ The `RenderText` method receives position, font properties, and fill color. It r
 svg.go        SVG parser (Document, Element types, Parse)
 pathdata.go   SVG path data parser (M, L, C, A, ... commands)
 render.go     PDF content stream renderer
-color.go      SVG color parser (hex, rgb(), named colors)
+color.go      SVG color parser (hex, rgb(), hsl(), named colors)
 transform.go  SVG transform parser and matrix math
 ```
 

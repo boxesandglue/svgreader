@@ -42,9 +42,11 @@ func (g *Gradient) Shading() (int, []float64) {
 
 // GradientStop represents a single <stop> inside a gradient.
 type GradientStop struct {
-	Offset      float64 // 0..1
-	Color       Color
-	StopOpacity float64 // 1 = opaque
+	// unknownColor is a stop-color that cannot be read, the stop is black.
+	unknownColor string
+	Offset       float64 // 0..1
+	Color        Color
+	StopOpacity  float64 // 1 = opaque
 }
 
 // uniformOpacity returns the opacity of the stops if it is the same for all of
@@ -71,6 +73,11 @@ const (
 	PaintNone PaintKind = iota
 	PaintColor
 	PaintGradient
+	// PaintInherit is the value inherit.
+	PaintInherit
+	// PaintUnknown is a value that cannot be read. As in a browser it counts
+	// as not given, so the paint is inherited.
+	PaintUnknown
 )
 
 // Paint is a resolved SVG paint value: either none, a uniform color, or a
@@ -83,11 +90,14 @@ type Paint struct {
 }
 
 // resolvePaint converts an SVG paint string ("none", "#rgb", "url(#id)", a
-// named color, etc.) into a Paint. Unparseable values become PaintNone.
+// named color, etc.) into a Paint.
 func resolvePaint(s string) Paint {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "none" || s == "transparent" {
 		return Paint{Kind: PaintNone}
+	}
+	if strings.EqualFold(s, "inherit") {
+		return Paint{Kind: PaintInherit}
 	}
 	if strings.HasPrefix(s, "url(") {
 		id := strings.TrimSuffix(strings.TrimPrefix(s, "url("), ")")
@@ -99,7 +109,10 @@ func resolvePaint(s string) Paint {
 		return Paint{Kind: PaintGradient, GradientRef: id}
 	}
 	c, alpha, err := parseColorAlpha(s)
-	if err != nil || c.IsNone {
+	if err != nil {
+		return Paint{Kind: PaintUnknown}
+	}
+	if c.IsNone {
 		return Paint{Kind: PaintNone}
 	}
 	return Paint{Kind: PaintColor, Color: c, Alpha: alpha}
@@ -287,7 +300,10 @@ func parseStop(start xml.StartElement) (GradientStop, bool) {
 	}
 	c, alpha, err := parseColorAlpha(stopColorAttr)
 	if err != nil {
-		return GradientStop{}, false
+		// As in a browser the value counts as not given, which is black.
+		// A gradient has no way to use a color of the document.
+		stop.unknownColor = stopColorAttr
+		c, alpha = Color{}, 1
 	}
 	if strings.EqualFold(strings.TrimSpace(stopColorAttr), "transparent") {
 		alpha = 0
