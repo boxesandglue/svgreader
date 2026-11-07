@@ -2,20 +2,42 @@ package svgreader
 
 import (
 	"encoding/xml"
+	"math"
 	"strconv"
 	"strings"
 )
 
-// LinearGradient is the parsed form of an SVG <linearGradient> element.
-// Only the subset needed for PDF Shading Type 2 (axial shading) is captured;
-// spreadMethod, xlink:href, and percentage coordinates against
-// objectBoundingBox are out of scope for the first iteration.
-type LinearGradient struct {
-	ID                string
-	X1, Y1, X2, Y2    float64
-	GradientUnits     string // "userSpaceOnUse" (default for this implementation)
+const userSpaceOnUse = "userSpaceOnUse"
+
+// Gradient is the parsed form of an SVG <linearGradient> or <radialGradient>
+// element. spreadMethod and xlink:href are not read.
+//
+// With GradientUnits "objectBoundingBox", the default of SVG, the coordinates
+// are fractions of the bounding box of the shape they fill. With
+// "userSpaceOnUse" they are user units, and a percentage is already resolved
+// against the viewport.
+type Gradient struct {
+	ID string
+	// Radial tells a <radialGradient> from a <linearGradient>.
+	Radial bool
+	// X1, Y1, X2, Y2 is the axis of a linear gradient.
+	X1, Y1, X2, Y2 float64
+	// CX, CY, R is the end circle of a radial gradient, offset 1.
+	CX, CY, R float64
+	// FX, FY, FR is the start circle of a radial gradient, offset 0.
+	FX, FY, FR        float64
+	GradientUnits     string
 	GradientTransform Matrix // Identity if absent
 	Stops             []GradientStop
+}
+
+// Shading returns the PDF shading type of the gradient, 2 (axial) or 3
+// (radial), and its /Coords.
+func (g *Gradient) Shading() (int, []float64) {
+	if g.Radial {
+		return 3, []float64{g.FX, g.FY, g.FR, g.CX, g.CY, g.R}
+	}
+	return 2, []float64{g.X1, g.Y1, g.X2, g.Y2}
 }
 
 // GradientStop represents a single <stop> inside a gradient.
@@ -27,7 +49,7 @@ type GradientStop struct {
 
 // uniformOpacity returns the opacity of the stops if it is the same for all of
 // them, so that a constant alpha can stand in for a soft mask.
-func (g *LinearGradient) uniformOpacity() (float64, bool) {
+func (g *Gradient) uniformOpacity() (float64, bool) {
 	if len(g.Stops) == 0 {
 		return 1, true
 	}
@@ -87,7 +109,7 @@ func resolvePaint(s string) Paint {
 // definitions into the document's Defs map. Non-gradient defs (filters,
 // clipPaths, …) are skipped — they can be added later without disturbing
 // this path.
-func parseDefs(dec *xml.Decoder, defs map[string]*LinearGradient) error {
+func parseDefs(dec *xml.Decoder, doc *Document) error {
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -96,13 +118,13 @@ func parseDefs(dec *xml.Decoder, defs map[string]*LinearGradient) error {
 		switch t := tok.(type) {
 		case xml.StartElement:
 			switch t.Name.Local {
-			case "linearGradient":
-				g, err := parseLinearGradient(dec, t)
+			case "linearGradient", "radialGradient":
+				g, err := parseGradient(dec, t, doc)
 				if err != nil {
 					return err
 				}
 				if g != nil && g.ID != "" {
-					defs[g.ID] = g
+					doc.Defs[g.ID] = g
 				}
 			default:
 				if err := dec.Skip(); err != nil {
@@ -115,37 +137,55 @@ func parseDefs(dec *xml.Decoder, defs map[string]*LinearGradient) error {
 	}
 }
 
-// parseLinearGradient reads a single <linearGradient> element including its
-// <stop> children. Returns nil if the element has no usable content (no id,
-// no stops).
-func parseLinearGradient(dec *xml.Decoder, start xml.StartElement) (*LinearGradient, error) {
-	g := &LinearGradient{
-		// SVG defaults for linearGradient coordinates are 0%,0%,100%,0% in
-		// objectBoundingBox space. We treat absent x2 as 1 so the default
-		// makes sense once objectBoundingBox is supported; userSpaceOnUse
-		// SVGs always supply all four explicitly anyway.
-		X2:                1,
+// parseGradient reads a single <linearGradient> or <radialGradient> element
+// including its <stop> children. Returns nil if the element has no usable
+// content (no id, no stops).
+func parseGradient(dec *xml.Decoder, start xml.StartElement, doc *Document) (*Gradient, error) {
+	attrs := attrMap(start.Attr)
+	g := &Gradient{
+		ID:                attrs["id"],
+		Radial:            start.Name.Local == "radialGradient",
 		GradientUnits:     "objectBoundingBox",
 		GradientTransform: Identity(),
 	}
-	for _, a := range start.Attr {
-		switch a.Name.Local {
-		case "id":
-			g.ID = a.Value
-		case "x1":
-			g.X1 = parseDimension(a.Value)
-		case "y1":
-			g.Y1 = parseDimension(a.Value)
-		case "x2":
-			g.X2 = parseDimension(a.Value)
-		case "y2":
-			g.Y2 = parseDimension(a.Value)
-		case "gradientUnits":
-			g.GradientUnits = a.Value
-		case "gradientTransform":
-			g.GradientTransform = ParseTransform(a.Value)
-		}
+	if v, ok := attrs["gradientUnits"]; ok {
+		g.GradientUnits = v
 	}
+	if v, ok := attrs["gradientTransform"]; ok {
+		g.GradientTransform = ParseTransform(v)
+	}
+
+	// A percentage in user space refers to the viewport, the radius to its
+	// normalized diagonal.
+	width, height := doc.ViewBox.Width, doc.ViewBox.Height
+	diagonal := math.Sqrt((width*width + height*height) / 2)
+	length := func(name, def string, reference float64) float64 {
+		v, ok := attrs[name]
+		if !ok {
+			v = def
+		}
+		return g.parseLength(v, reference)
+	}
+	if g.Radial {
+		g.CX = length("cx", "50%", width)
+		g.CY = length("cy", "50%", height)
+		g.R = length("r", "50%", diagonal)
+		g.FX = g.CX
+		if _, ok := attrs["fx"]; ok {
+			g.FX = length("fx", "", width)
+		}
+		g.FY = g.CY
+		if _, ok := attrs["fy"]; ok {
+			g.FY = length("fy", "", height)
+		}
+		g.FR = length("fr", "0%", diagonal)
+	} else {
+		g.X1 = length("x1", "0%", width)
+		g.Y1 = length("y1", "0%", height)
+		g.X2 = length("x2", "100%", width)
+		g.Y2 = length("y2", "0%", height)
+	}
+
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -169,9 +209,40 @@ func parseLinearGradient(dec *xml.Decoder, start xml.StartElement) (*LinearGradi
 			if g.ID == "" || len(g.Stops) == 0 {
 				return nil, nil
 			}
+			g.flattenIfEmpty()
 			return g, nil
 		}
 	}
+}
+
+// parseLength reads a coordinate of the gradient. reference is what a
+// percentage refers to in user space.
+func (g *Gradient) parseLength(s string, reference float64) float64 {
+	s = strings.TrimSpace(s)
+	if !strings.HasSuffix(s, "%") {
+		return parseDimension(s)
+	}
+	v := parseDimension(s) / 100
+	if g.GradientUnits == userSpaceOnUse {
+		return v * reference
+	}
+	return v
+}
+
+// flattenIfEmpty handles a gradient without any extent, which SVG paints in the
+// last stop. PDF would paint nothing, so it becomes a constant gradient with a
+// size.
+func (g *Gradient) flattenIfEmpty() {
+	empty := !g.Radial && g.X1 == g.X2 && g.Y1 == g.Y2
+	if g.Radial {
+		empty = g.R <= 0
+	}
+	if !empty {
+		return
+	}
+	g.Stops = g.Stops[len(g.Stops)-1:]
+	g.X2, g.R = g.X1+1, 1
+	g.FX, g.FY, g.FR = g.CX, g.CY, 0
 }
 
 func parseStop(start xml.StartElement) (GradientStop, bool) {

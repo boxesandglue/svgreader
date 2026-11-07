@@ -13,6 +13,7 @@ svgreader is used in [boxes and glue](https://github.com/boxesandglue/boxesandgl
 - **Groups**: `<g>` with style inheritance
 - **Transforms**: `translate()`, `rotate()`, `scale()`, `matrix()`, `skewX()`, `skewY()`
 - **Styling**: `fill`, `stroke`, `stroke-width`, `stroke-linecap`, `stroke-linejoin`, `fill-rule`, `opacity`, `fill-opacity`, `stroke-opacity`, `stop-opacity`; inline CSS via the `style` attribute
+- **Gradients**: `<linearGradient>` and `<radialGradient>` as a fill, in `objectBoundingBox` and `userSpaceOnUse` units, with `gradientTransform`; not yet on strokes and text, and without `spreadMethod` and `href`
 - **Colors**: Hex (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`), `rgb()` and `rgba()` functions, 148 named CSS colors
 - **Text**: `<text>` elements via a pluggable `TextRenderer` interface for external font shaping
 - **Aspect ratio**: Automatic scaling from viewBox to output size, with aspect-ratio preservation

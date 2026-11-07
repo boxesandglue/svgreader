@@ -31,9 +31,10 @@ type ShadingRegistrar interface {
 // ShadingRequest is the data the registrar needs to materialise a PDF
 // shading-pattern object. CTM is the renderer's current transformation
 // matrix at the point of fill; gradients use it together with their own
-// GradientTransform to build the pattern-to-page mapping.
+// GradientTransform to build the pattern-to-page mapping. For a gradient in
+// objectBoundingBox units it includes the bounding box of the shape.
 type ShadingRequest struct {
-	Gradient *LinearGradient
+	Gradient *Gradient
 	CTM      Matrix
 }
 
@@ -67,11 +68,14 @@ type OpacityRegistrar interface {
 
 // GradientMask asks for a soft mask with the opacity of the stops of Gradient.
 // The coordinates of a soft mask are those at the time its graphics state is
-// set, so the gradient needs no CTM here, unlike a ShadingRequest. BBox is
-// lower left x, lower left y, upper right x, upper right y in these coordinates
-// and covers the viewport.
+// set, so the gradient needs no CTM here, unlike a ShadingRequest. Matrix takes
+// the gradient to these coordinates: the bounding box of the shape for
+// objectBoundingBox units, else the identity. It goes before GradientTransform,
+// as the CTM of a ShadingRequest does. BBox is lower left x, lower left y,
+// upper right x, upper right y in these coordinates and covers the viewport.
 type GradientMask struct {
-	Gradient *LinearGradient
+	Gradient *Gradient
+	Matrix   Matrix
 	Opacity  float64 // applies to all stops, for fill-opacity and the like
 	BBox     [4]float64
 }
@@ -94,6 +98,10 @@ type RenderOptions struct {
 	// OpacityRegistrar, if non-nil, receives the alpha values and the groups
 	// of the drawing. When nil, everything is painted opaque.
 	OpacityRegistrar OpacityRegistrar
+
+	// Warn, if non-nil, receives a message for what the drawing asks for and
+	// the renderer cannot do. Each message comes once per rendering.
+	Warn func(message string)
 }
 
 // RenderPDF renders the SVG document as a PDF content stream.
@@ -132,6 +140,8 @@ type renderer struct {
 	elemOpacity float64
 	// only restricts the painting to one part of a shape.
 	only paintPart
+	// warned holds the messages that Warn has received.
+	warned map[string]bool
 }
 
 // paintPart selects what a shape paints.
@@ -201,9 +211,12 @@ func defaultStyle() resolvedStyle {
 
 // resolvedStyle holds computed style values for rendering.
 type resolvedStyle struct {
-	fill          Color
-	fillSet       bool
-	fillGradient  *LinearGradient // set when fill="url(#id)" resolves
+	fill         Color
+	fillSet      bool
+	fillGradient *Gradient // set when fill="url(#id)" resolves
+	// fillMatrix takes the coordinates of fillGradient to user space. It is
+	// set by paintStyle, as it depends on the shape.
+	fillMatrix    Matrix
 	stroke        Color
 	strokeSet     bool
 	strokeWidth   float64
@@ -340,6 +353,7 @@ func elementStyle(elem Element) StyleAttrs {
 // that overlap, or a stroke that overlaps its fill, have to be composited first
 // and need a group.
 func (r *renderer) renderElement(elem Element, inherited resolvedStyle) {
+	r.checkPaints(elem)
 	style := mergeStyle(inherited, elementStyle(elem), r.doc.Defs)
 	if style.opacity == 0 {
 		return
@@ -373,8 +387,34 @@ func (r *renderer) drawParts(elem Element, inherited, style resolvedStyle) {
 	r.only = paintAll
 }
 
-// paintStyle is the style of a shape with what it must not paint removed.
-func (r *renderer) paintStyle(inherited resolvedStyle, attrs StyleAttrs) resolvedStyle {
+// warn hands message to the host once.
+func (r *renderer) warn(message string) {
+	if r.opts.Warn == nil || r.warned[message] {
+		return
+	}
+	if r.warned == nil {
+		r.warned = map[string]bool{}
+	}
+	r.warned[message] = true
+	r.opts.Warn(message)
+}
+
+// checkPaints warns about the paints of elem that cannot be painted.
+func (r *renderer) checkPaints(elem Element) {
+	attrs := elementStyle(elem)
+	if paint := resolvePaint(attrs.Fill); paint.Kind == PaintGradient {
+		if _, ok := r.doc.Defs[paint.GradientRef]; !ok {
+			r.warn(fmt.Sprintf("SVG: fill refers to an unknown gradient: %s", paint.GradientRef))
+		}
+	}
+	if paint := resolvePaint(attrs.Stroke); paint.Kind == PaintGradient {
+		r.warn(fmt.Sprintf("SVG: a gradient is not supported for a stroke: %s", paint.GradientRef))
+	}
+}
+
+// paintStyle is the style of the shape elem with what it must not paint
+// removed.
+func (r *renderer) paintStyle(inherited resolvedStyle, attrs StyleAttrs, elem Element) resolvedStyle {
 	style := mergeStyle(inherited, attrs, r.doc.Defs)
 	switch r.only {
 	case paintFill:
@@ -382,6 +422,18 @@ func (r *renderer) paintStyle(inherited resolvedStyle, attrs StyleAttrs) resolve
 	case paintStroke:
 		style.fill = Color{IsNone: true}
 		style.fillGradient = nil
+	}
+	style.fillMatrix = Identity()
+	if g := style.fillGradient; g != nil && g.GradientUnits != userSpaceOnUse {
+		if b, ok := elementBounds(elem); ok {
+			if b.empty() {
+				// The units have no size, and SVG paints nothing.
+				style.fillGradient = nil
+				style.fill = Color{IsNone: true}
+			} else {
+				style.fillMatrix = b.matrix()
+			}
+		}
 	}
 	return style
 }
@@ -401,6 +453,7 @@ func (r *renderer) applyFillMask(style resolvedStyle, alpha float64) bool {
 	}
 	name := reg.RegisterGradientMask(GradientMask{
 		Gradient: style.fillGradient,
+		Matrix:   style.fillMatrix,
 		Opacity:  alpha,
 		BBox:     r.viewportIn(inverse),
 	})
@@ -477,7 +530,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		for _, child := range e.Children {
 			r.renderElement(child, style)
 		}
@@ -488,7 +541,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderPath(e.D, style)
 		r.popQ()
@@ -498,7 +551,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderRect(e, style)
 		r.popQ()
@@ -508,7 +561,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.R, e.R, style)
 		r.popQ()
@@ -518,7 +571,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderEllipse(e.Cx, e.Cy, e.Rx, e.Ry, style)
 		r.popQ()
@@ -528,7 +581,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.emitf("%s %s m %s %s l", fmtF(e.X1), fmtF(e.Y1), fmtF(e.X2), fmtF(e.Y2))
 		r.emitPaintOp(style)
@@ -539,7 +592,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, false)
 		r.emitPaintOp(style)
@@ -550,7 +603,7 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
 		r.applyStyle(style)
 		r.renderPolyPoints(e.Points, true)
 		r.emitPaintOp(style)
@@ -564,7 +617,10 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 		if e.Transform != "" {
 			r.applyTransform(ParseTransform(e.Transform))
 		}
-		style := r.paintStyle(inherited, e.Style)
+		style := r.paintStyle(inherited, e.Style, elem)
+		if style.fillGradient != nil {
+			r.warn(fmt.Sprintf("SVG: a gradient is not supported for text: %s", style.fillGradient.ID))
+		}
 		fillColor := style.fill
 		if style.fill.IsNone {
 			fillColor = Color{0, 0, 0, false}
@@ -592,58 +648,79 @@ func (r *renderer) drawElement(elem Element, inherited resolvedStyle) {
 }
 
 func (r *renderer) renderPath(d string, style resolvedStyle) {
-	cmds, err := ParsePathData(d)
+	ops, err := pathOperators(d)
 	if err != nil {
 		return
+	}
+	for _, op := range ops {
+		switch len(op.args) {
+		case 0:
+			r.emit("h")
+		case 2:
+			r.emitf("%s %s %c", fmtF(op.args[0]), fmtF(op.args[1]), op.name)
+		case 6:
+			r.emitf("%s %s %s %s %s %s c",
+				fmtF(op.args[0]), fmtF(op.args[1]),
+				fmtF(op.args[2]), fmtF(op.args[3]),
+				fmtF(op.args[4]), fmtF(op.args[5]))
+		}
+	}
+
+	r.emitPaintOp(style)
+}
+
+// pathOperator is a PDF path operator, m, l, c or h, and its operands.
+type pathOperator struct {
+	name byte
+	args []float64
+}
+
+// pathOperators turns SVG path data into PDF path operators.
+func pathOperators(d string) ([]pathOperator, error) {
+	cmds, err := ParsePathData(d)
+	if err != nil {
+		return nil, err
 	}
 
 	cmds = ResolveToAbsolute(cmds)
 	cmds = ExpandShorthands(cmds)
 
+	var ops []pathOperator
 	var cx, cy float64 // current point for Q→C conversion
 
 	for _, c := range cmds {
 		switch c.Cmd {
 		case 'M':
-			r.emitf("%s %s m", fmtF(c.Args[0]), fmtF(c.Args[1]))
 			cx, cy = c.Args[0], c.Args[1]
+			ops = append(ops, pathOperator{'m', []float64{cx, cy}})
 		case 'L':
-			r.emitf("%s %s l", fmtF(c.Args[0]), fmtF(c.Args[1]))
 			cx, cy = c.Args[0], c.Args[1]
+			ops = append(ops, pathOperator{'l', []float64{cx, cy}})
 		case 'H':
-			r.emitf("%s %s l", fmtF(c.Args[0]), fmtF(cy))
 			cx = c.Args[0]
+			ops = append(ops, pathOperator{'l', []float64{cx, cy}})
 		case 'V':
-			r.emitf("%s %s l", fmtF(cx), fmtF(c.Args[0]))
 			cy = c.Args[0]
+			ops = append(ops, pathOperator{'l', []float64{cx, cy}})
 		case 'C':
-			r.emitf("%s %s %s %s %s %s c",
-				fmtF(c.Args[0]), fmtF(c.Args[1]),
-				fmtF(c.Args[2]), fmtF(c.Args[3]),
-				fmtF(c.Args[4]), fmtF(c.Args[5]))
+			ops = append(ops, pathOperator{'c', c.Args[:6]})
 			cx, cy = c.Args[4], c.Args[5]
 		case 'Q':
 			// Convert quadratic to cubic for PDF
 			cx1, cy1, cx2, cy2 := QuadToCubic(cx, cy, c.Args[0], c.Args[1], c.Args[2], c.Args[3])
-			r.emitf("%s %s %s %s %s %s c",
-				fmtF(cx1), fmtF(cy1), fmtF(cx2), fmtF(cy2),
-				fmtF(c.Args[2]), fmtF(c.Args[3]))
+			ops = append(ops, pathOperator{'c', []float64{cx1, cy1, cx2, cy2, c.Args[2], c.Args[3]}})
 			cx, cy = c.Args[2], c.Args[3]
 		case 'A':
 			curves := arcToCubic(cx, cy, c.Args[0], c.Args[1], c.Args[2], c.Args[3] != 0, c.Args[4] != 0, c.Args[5], c.Args[6])
 			for _, crv := range curves {
-				r.emitf("%s %s %s %s %s %s c",
-					fmtF(crv[0]), fmtF(crv[1]),
-					fmtF(crv[2]), fmtF(crv[3]),
-					fmtF(crv[4]), fmtF(crv[5]))
+				ops = append(ops, pathOperator{'c', crv[:]})
 			}
 			cx, cy = c.Args[5], c.Args[6]
 		case 'Z':
-			r.emit("h")
+			ops = append(ops, pathOperator{name: 'h'})
 		}
 	}
-
-	r.emitPaintOp(style)
+	return ops, nil
 }
 
 func (r *renderer) renderRect(rect Rect, style resolvedStyle) {
@@ -733,7 +810,7 @@ func (r *renderer) applyStyle(style resolvedStyle) {
 			if reg := r.opts.ShadingRegistrar; reg != nil {
 				name := reg.RegisterShading(ShadingRequest{
 					Gradient: style.fillGradient,
-					CTM:      r.formInverse.Multiply(r.currentCTM()),
+					CTM:      r.formInverse.Multiply(r.currentCTM()).Multiply(style.fillMatrix),
 				})
 				if name != "" {
 					r.emit("/Pattern cs")
@@ -806,7 +883,7 @@ func (r *renderer) emitf(format string, args ...any) {
 }
 
 // mergeStyle applies an element's style attributes on top of the inherited style.
-func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearGradient) resolvedStyle {
+func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*Gradient) resolvedStyle {
 	s := parent
 	// Unlike fill-opacity, opacity is not inherited.
 	s.opacity = 1
@@ -823,9 +900,14 @@ func mergeStyle(parent resolvedStyle, attrs StyleAttrs, defs map[string]*LinearG
 				s.fillColorAlpha = 1
 				s.fillSet = true
 			}
-			// Unresolved gradient ref: keep the inherited fill rather than
-			// silently flipping to black — matches Firefox behaviour for
-			// dangling url() refs.
+			if _, ok := defs[paint.GradientRef]; !ok {
+				// SVG paints nothing for a reference without a target.
+				// checkPaints warns about it.
+				s.fill = Color{IsNone: true}
+				s.fillColorAlpha = 1
+				s.fillGradient = nil
+				s.fillSet = true
+			}
 		case PaintColor:
 			s.fill = paint.Color
 			s.fillColorAlpha = paint.Alpha

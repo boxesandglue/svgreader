@@ -219,7 +219,7 @@ func TestSingularTransformDrawsNothing(t *testing.T) {
 // TestShadingCTMInGroup: a pattern matrix maps to the coordinates of the form,
 // so the transformation outside of the group must not be part of it.
 func TestShadingCTMInGroup(t *testing.T) {
-	const grad = `<defs><linearGradient id="g"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient></defs>`
+	const grad = `<defs><linearGradient id="g" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient></defs>`
 	outside, inside := &fakeRegistrar{}, &fakeRegistrar{}
 	renderSVG(t, grad+`<g transform="translate(10,20)"><rect width="9" height="9" fill="url(#g)"/></g>`, outside)
 	renderSVG(t, grad+`<g transform="translate(10,20)"><g opacity="0.5" transform="translate(3,4)"><rect width="9" height="9" fill="url(#g)"/></g></g>`, inside)
