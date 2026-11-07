@@ -21,8 +21,8 @@ import (
 
 // Document represents a parsed SVG document.
 type Document struct {
-	Width      float64              // Document width in SVG user units
-	Height     float64              // Document height in SVG user units
+	Width      float64              // Document width in points, one user unit is one point
+	Height     float64              // Document height in points
 	ViewBox    ViewBox              // ViewBox specification
 	Elements   []Element            // Child elements in document order
 	FontFamily string               // Default font-family from the <svg> element
@@ -512,11 +512,28 @@ func parseDimension(s string) float64 {
 	return f
 }
 
-// parseSize parses the width or height of the svg element. A percentage refers
-// to the container and tells nothing about the image, so it counts as not set.
+// pointsPerUnit holds the units of parseSize that differ from one point.
+var pointsPerUnit = map[string]float64{
+	"in": 72,
+	"cm": 72 / 2.54,
+	"mm": 72 / 25.4,
+	"pc": 12,
+}
+
+// parseSize parses the width or height of the svg element, in points. One user
+// unit is one point, so a size without a unit and px stay as they are. A
+// percentage refers to the container and tells nothing about the image, so it
+// counts as not set.
 func parseSize(s string) float64 {
-	if strings.HasSuffix(strings.TrimSpace(s), "%") {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "%") {
 		return 0
+	}
+	if len(s) > 2 {
+		if factor, ok := pointsPerUnit[s[len(s)-2:]]; ok {
+			f, _ := strconv.ParseFloat(strings.TrimSpace(s[:len(s)-2]), 64)
+			return f * factor
+		}
 	}
 	return parseDimension(s)
 }

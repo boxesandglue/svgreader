@@ -1,6 +1,7 @@
 package svgreader
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -284,6 +285,11 @@ func TestDocumentSize(t *testing.T) {
 		{"no viewBox", `width="30" height="20"`, 30, 20},
 		{"width without viewBox", `width="30"`, 30, 0},
 		{"nothing", ``, 0, 0},
+		{"inch", `width="1in" viewBox="0 0 200 50"`, 72, 18},
+		{"centimeter", `width="2.54cm" height="72pt"`, 72, 72},
+		{"millimeter", `width="25.4mm" viewBox="0 0 100 50"`, 72, 36},
+		{"pica", `width="2pc" height="1pc"`, 24, 12},
+		{"px is a user unit", `width="30px" height="20px"`, 30, 20},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,7 +297,7 @@ func TestDocumentSize(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if doc.Width != tc.width || doc.Height != tc.height {
+			if math.Abs(doc.Width-tc.width) > 1e-9 || math.Abs(doc.Height-tc.height) > 1e-9 {
 				t.Errorf("size = %g x %g, want %g x %g", doc.Width, doc.Height, tc.width, tc.height)
 			}
 		})
